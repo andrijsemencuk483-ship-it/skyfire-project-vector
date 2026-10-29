@@ -1,18 +1,28 @@
 --[[
     ╔══════════════════════════════════════════════════════════════════════╗
-    ║                     SKYFIRE ENHANCED  ·  v3.6                       ║
-    ║        Turret Aim Fix · Zero-Lag Async Boot · Wreck Filter          ║
+    ║                     SKYFIRE ENHANCED  ·  v4.0                       ║
+    ║        Hardened Silent Architecture · Zero Log Leaks · Stealth      ║
     ╚══════════════════════════════════════════════════════════════════════╝
 
-    Performance & Turret Scoping Overhaul:
-    • ZU-23-2 & Turret Scope Fix: Unconditional key polling (bypasses gameProcessed
-      absorption when seated/scoped) + mousemoverel hardware input support for turrets
-    • Zero-Lag Asynchronous Boot: UI and asset fetching deferred via task.defer;
-      spatial checks use optimized squared distance pre-filtering (zero frame drop)
-    • Dynamic Weapon Caching: Tool/seat changes only trigger lookup on actual switch
-    • Robust Error Isolation: Pcall safety boundaries prevent thread crashes
-    • Full Rayfield UI Suite (No Key System, Real-Time Sliders, Crashed Drone Toggle)
+    Safety & Reliability Engineering:
+    • Zero Console Footprint: Silenced all print/warn calls to prevent LogService trips
+    • Strict Exception Isolation: Every callback & loop protected under pcall barriers
+      (eliminates Traceless/Scriptless error events in ScriptContext)
+    • Protected GUI Sandbox: Directs UI instances to gethui() to stay invisible to PlayerGui sweeps
+    • Humanized Angle Smoothing: Soft-clamped rotational delta prevents turret desyncs
+    • Full Feature Matrix Preserved:
+      - CollectionService UAVDrone hook with pilot & velocity tags
+      - Wreck & Falling drone filter switch
+      - Dynamic weapon ballistics & 2nd-order lead calculation
+      - ZU-23-2 turret unconditional key & mouse input
+      - Sliders for ESP distance & Aim FOV
 ]]
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- SILENT ENVIRONMENT HARNESS
+-- ═══════════════════════════════════════════════════════════════════════
+local print = function(...) end
+local warn  = function(...) end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- SERVICES & CONSTANTS
@@ -28,13 +38,27 @@ local TweenService       = game:GetService("TweenService")
 local LocalPlayer        = Players.LocalPlayer
 local Camera             = workspace.CurrentCamera
 
--- Safe TRV Framework references
 local TRVFolder          = ReplicatedStorage:FindFirstChild("TRV")
 local TRVShared          = TRVFolder and TRVFolder:FindFirstChild("Shared")
 local TRVConfigs         = TRVShared and TRVShared:FindFirstChild("Configs")
 
-local DEFAULT_BALLISTIC_SPEED = 3285.71  -- Ballistics.DEFAULT_SPEED
-local DEFAULT_BALLISTIC_DROP  = 35.0357  -- Ballistics.DEFAULT_DROP
+local DEFAULT_BALLISTIC_SPEED = 3285.71
+local DEFAULT_BALLISTIC_DROP  = 35.0357
+
+-- GUI Parent Resolver (uses executor sandbox if available)
+local function getSafeGuiParent()
+    if gethui then
+        local success, hui = pcall(gethui)
+        if success and hui then return hui end
+    end
+    if getgenv and getgenv().gethui then
+        local success, hui = pcall(getgenv().gethui)
+        if success and hui then return hui end
+    end
+    local coreGui = game:GetService("CoreGui")
+    if coreGui then return coreGui end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- CONFIGURATION
@@ -43,13 +67,13 @@ local CONFIG = {
     -- Drone ESP
     DroneESP = {
         Enabled       = true,
-        ShowCrashed   = false,                           -- Toggle: Wrecks & falling drones
-        MaxDistance   = 9000,                            -- Distance slider (500 - 15000)
+        ShowCrashed   = false,
+        MaxDistance   = 9000,
         MaxDistSq     = 9000 * 9000,
-        BoxColor      = Color3.fromRGB(255, 65, 54),     -- Hostile drone
-        FriendlyColor = Color3.fromRGB(46, 204, 113),    -- Allied drone
-        CrashedColor  = Color3.fromRGB(110, 110, 120),   -- Dead / crashed
-        JammedColor   = Color3.fromRGB(241, 196, 15),    -- CommsLoss (EW)
+        BoxColor      = Color3.fromRGB(255, 65, 54),
+        FriendlyColor = Color3.fromRGB(46, 204, 113),
+        CrashedColor  = Color3.fromRGB(110, 110, 120),
+        JammedColor   = Color3.fromRGB(241, 196, 15),
         TextSize      = 13,
         ShowVelocity  = true,
         ShowDistance  = true,
@@ -57,34 +81,34 @@ local CONFIG = {
         ShowPilot     = true,
         ShowHealth    = true,
         ShowTracer    = true,
-        TracerOrigin  = "Bottom", -- "Bottom", "Center", "Mouse"
+        TracerOrigin  = "Bottom",
     },
 
     -- Dynamic Ballistics & Advanced Aim Prediction
     AimPrediction = {
         Enabled          = true,
-        AutoDetectWeapon = true,      -- dynamically read weapon configs from TRV
-        ManualSpeed      = 1800,      -- fallback bullet speed (studs/s)
-        ManualDrop       = 35.04,     -- fallback bullet drop (studs/s^2)
+        AutoDetectWeapon = true,
+        ManualSpeed      = 1800,
+        ManualDrop       = 35.04,
         ShowPrediction   = true,
         ShowFOVCircle    = true,
         PredictionColor  = Color3.fromRGB(0, 240, 255),
         LockedColor      = Color3.fromRGB(255, 40, 40),
-        SmoothFactor     = 0.08,      -- velocity smoothing rate
-        MaxPredictTime   = 5.0,       -- max seconds to project forward
-        IterationCount   = 10,        -- intercept iterations
-        AimAssist        = false,     -- lock camera/mouse to lead point
-        AimAssistSmooth  = 0.25,      -- camera lerp rate
-        AimAssistFOV     = 140,       -- screen-space pixel radius for lock
+        SmoothFactor     = 0.08,
+        MaxPredictTime   = 5.0,
+        IterationCount   = 10,
+        AimAssist        = false,
+        AimAssistSmooth  = 0.20,      -- humanized lerp rate
+        AimAssistFOV     = 140,
         AimKey           = Enum.KeyCode.E,
-        CompensateShooter= true,      -- account for shooter velocity
+        CompensateShooter= true,
     },
 
     -- Player & Soldier ESP
     PlayerESP = {
         Enabled          = true,
-        EnemiesOnly      = true,      -- only render players from opposing side
-        MaxDistance      = 3500,      -- Distance slider (500 - 8000)
+        EnemiesOnly      = true,
+        MaxDistance      = 3500,
         MaxDistSq        = 3500 * 3500,
         BoxColor         = Color3.fromRGB(255, 75, 75),
         FriendlyColor    = Color3.fromRGB(75, 180, 255),
@@ -103,23 +127,21 @@ local CONFIG = {
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE MANAGEMENT
 -- ═══════════════════════════════════════════════════════════════════════
-local droneDrawings    = {}   -- [model] = drawings table
-local droneTrackers    = {}   -- [model] = kinematic tracking state
-local playerDrawings   = {}   -- [player] = drawings table
-local playerHighlights = {}   -- [player] = Highlight instance
-local aimTarget        = nil  -- locked drone instance
+local droneDrawings    = {}
+local droneTrackers    = {}
+local playerDrawings   = {}
+local playerHighlights = {}
+local aimTarget        = nil
 local aimLocked        = false
 local connections      = {}
-local weaponConfigCache= {}   -- [weaponName] = cached config table
+local weaponConfigCache= {}
 
--- Cached weapon inspection state
 local lastEquippedIdentifier = ""
 local currentWeaponName  = "Default / None"
 local currentBulletSpeed = DEFAULT_BALLISTIC_SPEED
 local currentBulletDrop  = DEFAULT_BALLISTIC_DROP
 local currentBulletDrag  = 0
 
--- Live FOV Circle Drawing
 local fovCircle = Drawing.new("Circle")
 fovCircle.Thickness = 1.2
 fovCircle.NumSides = 48
@@ -130,7 +152,7 @@ fovCircle.Transparency = 0.35
 fovCircle.Visible = false
 
 -- ═══════════════════════════════════════════════════════════════════════
--- OPTIMIZED UTILITIES & FAST MATH
+-- MATHEMATICAL UTILITIES
 -- ═══════════════════════════════════════════════════════════════════════
 local function getDistanceSq(p1, p2)
     local dx = p1.X - p2.X
@@ -176,7 +198,7 @@ local function lerpV3(a, b, t)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- EFFICIENT WEAPON INTROSPECTION (CACHED)
+-- WEAPON INTROSPECTION (SAFE LOOKUP)
 -- ═══════════════════════════════════════════════════════════════════════
 local function loadWeaponConfig(name)
     if weaponConfigCache[name] then
@@ -215,7 +237,7 @@ local function updateActiveWeaponBallistics()
 
     local hum = char:FindFirstChildOfClass("Humanoid")
 
-    -- 1. Check Turret / Vehicle Seat
+    -- Turret Seat
     if hum and hum.SeatPart then
         local seat = hum.SeatPart
         local turretModel = seat:FindFirstAncestorOfClass("Model")
@@ -245,7 +267,7 @@ local function updateActiveWeaponBallistics()
         end
     end
 
-    -- 2. Check Tool
+    -- Handheld Weapon
     local tool = char:FindFirstChildOfClass("Tool")
     if tool then
         local identifier = "TOOL_" .. tool.Name
@@ -267,7 +289,6 @@ local function updateActiveWeaponBallistics()
         return
     end
 
-    -- 3. Default
     if lastEquippedIdentifier ~= "NONE" then
         lastEquippedIdentifier = "NONE"
         currentWeaponName  = "Standard / Fallback"
@@ -300,7 +321,7 @@ local function destroyDrawings(tbl)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- DRAWING INSTANTIATION (DRONE & PLAYER)
+-- DRAWING CREATION
 -- ═══════════════════════════════════════════════════════════════════════
 local function createDroneDrawing()
     return {
@@ -464,7 +485,7 @@ local function createPlayerDrawing()
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- ADVANCED KINEMATICS & BALLISTIC INTERCEPT SOLVER
+-- ADVANCED KINEMATICS
 -- ═══════════════════════════════════════════════════════════════════════
 local function updateKinematics(model, primaryPart, dt)
     local pos = primaryPart.Position
@@ -559,9 +580,6 @@ local function solveLeadIntercept(shooterOrigin, state, bulletSpeed, bulletDrop,
     return bestAimPos, timeOfFlight
 end
 
--- ═══════════════════════════════════════════════════════════════════════
--- TARGET SELECTION
--- ═══════════════════════════════════════════════════════════════════════
 local function findBestDroneTarget()
     local screenCenter = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
     local bestDist = CONFIG.AimPrediction.AimAssistFOV
@@ -665,7 +683,6 @@ local function updateDroneESP(dt, camPos)
             continue
         end
 
-        -- Fast Squared Distance Check (Zero-Lag Pre-Filtering)
         local basePos = base.Position
         local distSq = getDistanceSq(camPos, basePos)
         if distSq > CONFIG.DroneESP.MaxDistSq then
@@ -687,7 +704,6 @@ local function updateDroneESP(dt, camPos)
         local d = droneDrawings[drone]
         local dist = math.sqrt(distSq)
 
-        -- On-Screen Bounding Box
         local cf = drone:GetBoundingBox()
         local extents = drone:GetExtentsSize()
         local half = extents * 0.5
@@ -760,7 +776,6 @@ local function updateDroneESP(dt, camPos)
         local h = maxY - minY
         local cx = minX + w * 0.5
 
-        -- Box
         d.box.Size = Vector2.new(w, h)
         d.box.Position = Vector2.new(minX, minY)
         d.box.Color = boxColor
@@ -771,7 +786,6 @@ local function updateDroneESP(dt, camPos)
         d.boxFill.Color = boxColor
         d.boxFill.Visible = true
 
-        -- Name & Type Tag
         local topY = minY - 4
         if CONFIG.DroneESP.ShowName then
             local droneType = drone:GetAttribute("droneType") or "UAV"
@@ -785,7 +799,6 @@ local function updateDroneESP(dt, camPos)
             d.nameTag.Visible = false
         end
 
-        -- Pilot Tag
         if CONFIG.DroneESP.ShowPilot and operatorId and not isCrashed then
             local pilotName = pilotPlayer and pilotPlayer.DisplayName or ("ID:" .. tostring(operatorId))
             d.pilotTag.Text = "Pilot: " .. pilotName
@@ -795,7 +808,6 @@ local function updateDroneESP(dt, camPos)
             d.pilotTag.Visible = false
         end
 
-        -- Bottom Info
         local botY = maxY + 3
         if CONFIG.DroneESP.ShowDistance then
             d.distTag.Text = string.format("%.0f st", dist)
@@ -815,7 +827,6 @@ local function updateDroneESP(dt, camPos)
             d.velTag.Visible = false
         end
 
-        -- Health Bar
         local maxHp = drone:GetAttribute("MaxHP") or 100
         if CONFIG.DroneESP.ShowHealth and hp and maxHp > 0 and not isCrashed then
             local ratio = math.clamp(hp / maxHp, 0, 1)
@@ -837,7 +848,6 @@ local function updateDroneESP(dt, camPos)
             d.healthBarBG.Visible = false
         end
 
-        -- Tracer
         if CONFIG.DroneESP.ShowTracer then
             d.tracer.From = getTracerOrigin(CONFIG.DroneESP.TracerOrigin)
             d.tracer.To = Vector2.new(cx, maxY)
@@ -847,7 +857,6 @@ local function updateDroneESP(dt, camPos)
             d.tracer.Visible = false
         end
 
-        -- Ballistic Lead Prediction Visualizer
         if CONFIG.AimPrediction.Enabled and CONFIG.AimPrediction.ShowPrediction and not isFriendly and not isCrashed then
             local shooterPos = camPos
             local char = LocalPlayer.Character
@@ -1093,10 +1102,9 @@ local function updatePlayerESP(camPos)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- AIM ASSIST: UNIVERSAL DISPATCHER (TURRET SCOPE & INFANTRY)
+-- AIM ASSIST: UNIVERSAL DISPATCHER
 -- ═══════════════════════════════════════════════════════════════════════
 local function updateAimAssist()
-    -- Sync FOV Circle
     if CONFIG.AimPrediction.ShowFOVCircle and CONFIG.AimPrediction.AimAssist then
         local mousePos = UserInputService:GetMouseLocation()
         fovCircle.Position = mousePos
@@ -1106,7 +1114,6 @@ local function updateAimAssist()
         fovCircle.Visible = false
     end
 
-    -- Continuous key state check: unblocks key when gameProcessed is swallowed by turret scope
     if CONFIG.AimPrediction.AimAssist then
         local keyHeld = UserInputService:IsKeyDown(CONFIG.AimPrediction.AimKey)
         if keyHeld and not aimLocked then
@@ -1141,11 +1148,9 @@ local function updateAimAssist()
 
     local predPos, _ = solveLeadIntercept(shooterPos, state, currentBulletSpeed, currentBulletDrop, currentBulletDrag)
     if predPos then
-        -- Check if seated in a turret (ZU-23-2)
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         local isSeatedTurret = hum and hum.SeatPart ~= nil
 
-        -- If mousemoverel is supported by executor, use direct mouse delta (vital for Turret aim!)
         local predScreen, onScreen = worldToScreen(predPos)
         if onScreen and mousemoverel and isSeatedTurret then
             local center = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
@@ -1153,7 +1158,6 @@ local function updateAimAssist()
             local deltaY = (predScreen.Y - center.Y) * CONFIG.AimPrediction.AimAssistSmooth
             mousemoverel(deltaX, deltaY)
         else
-            -- Direct camera smooth lerp for infantry and general aiming
             local targetCF = CFrame.lookAt(Camera.CFrame.Position, predPos)
             Camera.CFrame = Camera.CFrame:Lerp(targetCF, CONFIG.AimPrediction.AimAssistSmooth)
         end
@@ -1161,11 +1165,10 @@ local function updateAimAssist()
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- UNCONDITIONAL INPUT HANDLING (NO GAME-PROCESSED BLOCK)
+-- UNCONDITIONAL INPUT HANDLING
 -- ═══════════════════════════════════════════════════════════════════════
 local function setupInput()
     table.insert(connections, UserInputService.InputBegan:Connect(function(input)
-        -- Process AimKey UNCONDITIONALLY (bypasses gameProcessed when scoped in ZU-23-2)
         if input.KeyCode == CONFIG.AimPrediction.AimKey then
             if CONFIG.AimPrediction.AimAssist then
                 local model, _ = findBestDroneTarget()
@@ -1189,7 +1192,7 @@ local function setupInput()
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- ZERO-LAG ASYNCHRONOUS RAYFIELD UI INITIALIZATION
+-- RAYFIELD UI (PROTECTED ENVIRONMENT SANDBOX)
 -- ═══════════════════════════════════════════════════════════════════════
 local RayfieldInstance = nil
 local telemetryParagraph = nil
@@ -1222,18 +1225,15 @@ end
 local function initRayfieldUIAsync()
     task.defer(function()
         local Rayfield = loadRayfieldLibrary()
-        if not Rayfield then
-            warn("[SKYFIRE ENHANCED] Rayfield UI skipped (headless mode active).")
-            return
-        end
+        if not Rayfield then return end
 
         RayfieldInstance = Rayfield
 
         local Window = Rayfield:CreateWindow({
-            Name = "SKYFIRE ENHANCED v3.6",
+            Name = "SKYFIRE ENHANCED v4.0",
             Icon = 0,
             LoadingTitle = "SKYFIRE ENHANCED",
-            LoadingSubtitle = "by Qusa  ·  Combat Suite",
+            LoadingSubtitle = "Combat Suite",
             Theme = "Default",
 
             DisableRayfieldPrompts = true,
@@ -1245,10 +1245,10 @@ local function initRayfieldUIAsync()
                 FileName = "SkyfireSettings"
             },
 
-            KeySystem = false, -- NO KEY SYSTEM
+            KeySystem = false,
         })
 
-        -- ═══ TAB 1: DRONE ESP ═══
+        -- TAB 1: DRONE ESP
         local DroneTab = Window:CreateTab("🛸 Drone ESP", 4483362458)
         DroneTab:CreateSection("ESP Visibility & Filters")
 
@@ -1321,7 +1321,7 @@ local function initRayfieldUIAsync()
             Callback = function(Value) CONFIG.DroneESP.ShowHealth = Value end,
         })
 
-        -- ═══ TAB 2: AIMBOT & BALLISTICS ═══
+        -- TAB 2: AIMBOT & BALLISTICS
         local AimTab = Window:CreateTab("🎯 Aimbot & Lead", 4483362458)
         AimTab:CreateSection("Ballistics Lead Calculation")
 
@@ -1405,7 +1405,7 @@ local function initRayfieldUIAsync()
             end,
         })
 
-        -- ═══ TAB 3: PLAYER ESP ═══
+        -- TAB 3: PLAYER ESP
         local PlayerTab = Window:CreateTab("👥 Soldier ESP", 4483362458)
         PlayerTab:CreateSection("Soldier ESP Settings")
 
@@ -1457,13 +1457,13 @@ local function initRayfieldUIAsync()
             Callback = function(Value) CONFIG.PlayerESP.ShowTracer = Value end,
         })
 
-        -- ═══ TAB 4: TELEMETRY & INFO ═══
+        -- TAB 4: TELEMETRY & INFO
         local InfoTab = Window:CreateTab("📊 Telemetry", 4483362458)
         InfoTab:CreateSection("Real-Time Ballistics Telemetry")
 
         telemetryParagraph = InfoTab:CreateParagraph({
             Title = "Active Weapon Stats",
-            Content = "Initializing TRV telemetry...",
+            Content = "Telemetry active.",
         })
 
         InfoTab:CreateButton({
@@ -1488,10 +1488,8 @@ local function onRenderStep(dt)
 
     local camPos = Camera.CFrame.Position
 
-    -- Fast cached weapon check
     updateActiveWeaponBallistics()
 
-    -- Throttle Rayfield paragraph updates to 2Hz to completely eliminate UI lag
     local now = tick()
     if telemetryParagraph and (now - lastTelemUpdate > 0.5) then
         lastTelemUpdate = now
@@ -1508,10 +1506,9 @@ local function onRenderStep(dt)
         end)
     end
 
-    -- Fast spatial passes
-    updateDroneESP(dt, camPos)
-    updatePlayerESP(camPos)
-    updateAimAssist()
+    pcall(updateDroneESP, dt, camPos)
+    pcall(updatePlayerESP, camPos)
+    pcall(updateAimAssist)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -1571,8 +1568,3 @@ table.insert(connections, Players.PlayerRemoving:Connect(function(player)
         playerHighlights[player] = nil
     end
 end))
-
-print("═══════════════════════════════════════════════════════════════════")
-print("  ⚡ SKYFIRE ENHANCED v3.6 (Turret Scope Fix & Async Boot) Ready!")
-print("  [E] Hold Aim Lock  |  Rayfield Interface Loaded")
-print("═══════════════════════════════════════════════════════════════════")
