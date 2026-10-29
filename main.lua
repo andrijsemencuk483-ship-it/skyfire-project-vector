@@ -5,14 +5,15 @@
     ║          Soldier ESP · Dynamic Ballistics · Silent Stealth          ║
     ╚══════════════════════════════════════════════════════════════════════╝
 
-    Engine Architecture:
-    • Native Vector Menu (menu.*) — Clean ImGui integration, zero ScreenGui footprint
+    Architecture & Capabilities:
+    • Native Vector Menu (menu.*) — Tabs organized under Combat, Visuals, and Misc
+    • Dual-Access Aim Prediction Menu — Fully configurable in [Combat] and [Visuals]
     • Native Overlay Pipeline (draw.* in OnFrame) — D3D/Vulkan overlay rendering
-    • OS-Level Input Polling (input.IsKeyDown) — Bypasses Roblox turret input blockades
+    • OS-Level Input Polling (input.IsKeyDown) — Bypasses ZU-23-2 turret input blockades
     • 2nd-Order Lead Solver — Smooth velocity, acceleration, gravity drop, drag
-    • TRV Dynamic Ballistics — Auto-detects handheld weapons & ZU-23-2 turret stats
-    • Wreck & Falling Filter — Per-user toggle for crashed drones
-    • Soldier ESP & Chams — Powered by entity.GetPlayers() and native chams
+    • TRV Dynamic Ballistics — Auto-detects handheld weapons & ZU-23-2 turret profiles
+    • Wreck & Falling Filter — On/Off toggle for downed or unexploded drones
+    • Soldier ESP & Chams — Driven by entity.GetPlayers() with faction/side awareness
 ]]
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -29,76 +30,91 @@ local DEFAULT_BALLISTIC_DROP  = 35.0357
 local VK_E                    = 0x45 -- Virtual Key 'E'
 
 -- ═══════════════════════════════════════════════════════════════════════
--- INITIALIZE VECTOR MENU
+-- SAFE UI BUILDER HELPER (Guarantees Zero Cascade Aborts)
 -- ═══════════════════════════════════════════════════════════════════════
-pcall(function()
-    -- Tab 1: Drones
-    menu.AddTab("Drones", "D")
-    menu.AddGroup("Drones", "Drone ESP")
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_esp", "Enable Drone ESP", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_box", "Bounding Boxes", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_name", "Model Name", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_pilot", "Pilot Name", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_dist", "Distance", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_vel", "Velocity Tag", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_hp", "Health Bar", true)
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_tracer", "Snaplines (Tracers)", true)
-    menu.AddCombo("Drones", "Drone ESP", "drone_tracer_origin", "Tracer Origin", {"Bottom", "Screen Center", "Mouse"}, 0)
-    menu.AddSeparator("Drones", "Drone ESP")
-    menu.AddCheckbox("Drones", "Drone ESP", "drone_crashed", "Show Crashed / Wrecks", false)
-    menu.AddSliderInt("Drones", "Drone ESP", "drone_max_dist", "Max Drone Distance", 500, 15000, 9000, "%d studs")
-    menu.AddSeparator("Drones", "Drone ESP")
-    menu.AddColorpicker("Drones", "Drone ESP", "drone_col_enemy", "Enemy Drone Color", {1.0, 0.25, 0.2, 1.0})
-    menu.AddColorpicker("Drones", "Drone ESP", "drone_col_friendly", "Friendly Drone Color", {0.18, 0.8, 0.44, 1.0})
-    menu.AddColorpicker("Drones", "Drone ESP", "drone_col_crashed", "Wreck Color", {0.45, 0.45, 0.5, 1.0})
+local function safeUI(fn, ...)
+    local ok, res = pcall(fn, ...)
+    return ok and res or nil
+end
 
-    -- Tab 2: Aim Prediction & Assist
-    menu.AddTab("Aimbot", "A")
-    menu.AddGroup("Aimbot", "Lead Prediction")
-    menu.AddCheckbox("Aimbot", "Lead Prediction", "aim_enabled", "Enable Lead Prediction", true)
-    menu.AddCheckbox("Aimbot", "Lead Prediction", "aim_lead_circle", "Draw Lead Circle", true)
-    menu.AddCheckbox("Aimbot", "Lead Prediction", "aim_lead_line", "Draw Lead Vector Line", true)
-    menu.AddColorpicker("Aimbot", "Lead Prediction", "aim_col_lead", "Lead Circle Color", {0.0, 0.94, 1.0, 1.0})
-    menu.AddColorpicker("Aimbot", "Lead Prediction", "aim_col_locked", "Target Locked Color", {1.0, 0.15, 0.15, 1.0})
-    menu.AddSliderInt("Aimbot", "Lead Prediction", "aim_iters", "Solver Iterations", 3, 20, 10, "%d iters")
-    menu.AddSliderFloat("Aimbot", "Lead Prediction", "aim_max_time", "Max Predict Time", 1.0, 10.0, 5.0, "%.1f s")
-    menu.AddSliderFloat("Aimbot", "Lead Prediction", "aim_smooth_factor", "Kinematic Filter Smooth", 0.02, 0.3, 0.08, "%.2f")
+-- ═══════════════════════════════════════════════════════════════════════
+-- INITIALIZE VECTOR MENU (Standard Vector Tabs: Combat, Visuals, Misc)
+-- ═══════════════════════════════════════════════════════════════════════
+-- TAB 1: COMBAT (Aim Prediction, Aim Assist, Weapon Ballistics)
+safeUI(menu.AddTab, "Combat", "C")
 
-    menu.AddGroup("Aimbot", "Aim Assist", 0, true)
-    menu.AddCheckbox("Aimbot", "Aim Assist", "aim_assist", "Enable Aim Assist", true)
-    menu.AddHotkey("Aimbot", "Aim Assist", "aim_key", "Aim Assist Key", VK_E)
-    menu.AddCombo("Aimbot", "Aim Assist", "aim_assist_mode", "Assist Type", {"Camera LookAt", "Mouse Move"}, 0)
-    menu.AddSliderInt("Aimbot", "Aim Assist", "aim_fov", "Aim FOV Radius", 20, 600, 140, "%d px")
-    menu.AddCheckbox("Aimbot", "Aim Assist", "aim_show_fov", "Show FOV Circle", true)
-    menu.AddSliderFloat("Aimbot", "Aim Assist", "aim_smooth", "Aim Smoothing (Higher = Slower)", 1.0, 25.0, 4.0, "%.1f")
+safeUI(menu.AddGroup, "Combat", "Aim Prediction")
+safeUI(menu.AddCheckbox, "Combat", "Aim Prediction", "aim_enabled", "Enable Lead Prediction", true)
+safeUI(menu.AddCheckbox, "Combat", "Aim Prediction", "aim_lead_circle", "Draw Lead Circle", true)
+safeUI(menu.AddCheckbox, "Combat", "Aim Prediction", "aim_lead_line", "Draw Lead Vector Line", true)
+safeUI(menu.AddColorpicker, "Combat", "Aim Prediction", "aim_col_lead", "Lead Circle Color", {0.0, 0.94, 1.0, 1.0})
+safeUI(menu.AddColorpicker, "Combat", "Aim Prediction", "aim_col_locked", "Target Locked Color", {1.0, 0.15, 0.15, 1.0})
+safeUI(menu.AddSliderInt, "Combat", "Aim Prediction", "aim_iters", "Solver Iterations", 3, 20, 10, "%d")
+safeUI(menu.AddSliderFloat, "Combat", "Aim Prediction", "aim_max_time", "Max Predict Time (s)", 1.0, 10.0, 5.0, "%.1f")
+safeUI(menu.AddSliderFloat, "Combat", "Aim Prediction", "aim_smooth_factor", "Kinematic Filter Smooth", 0.02, 0.3, 0.08, "%.2f")
 
-    -- Tab 3: Soldiers
-    menu.AddTab("Soldiers", "S")
-    menu.AddGroup("Soldiers", "Soldier ESP")
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_esp", "Enable Soldier ESP", true)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_enemy_only", "Enemies Only (DRG / Opponents)", true)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_box", "Show Boxes", true)
-    menu.AddCombo("Soldiers", "Soldier ESP", "soldier_box_style", "Box Style", {"Full Box", "Corner Box"}, 1)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_chams", "Player Chams (Native)", false)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_name", "Player Names", true)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_dist", "Distance", true)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_hp", "Health Bar", true)
-    menu.AddCheckbox("Soldiers", "Soldier ESP", "soldier_tracer", "Tracers", false)
-    menu.AddSliderInt("Soldiers", "Soldier ESP", "soldier_max_dist", "Max Distance", 200, 6000, 3500, "%d studs")
-    menu.AddColorpicker("Soldiers", "Soldier ESP", "soldier_col_enemy", "Enemy Soldier Color", {1.0, 0.28, 0.28, 1.0})
-    menu.AddColorpicker("Soldiers", "Soldier ESP", "soldier_col_friendly", "Friendly Soldier Color", {0.28, 0.7, 1.0, 1.0})
+safeUI(menu.AddGroup, "Combat", "Aim Assist")
+safeUI(menu.AddCheckbox, "Combat", "Aim Assist", "aim_assist", "Enable Aim Assist (Lock)", true)
+safeUI(menu.AddHotkey, "Combat", "Aim Assist", "aim_key", "Aim Assist Key (Default: E)", VK_E)
+safeUI(menu.AddCombo, "Combat", "Aim Assist", "aim_assist_mode", "Assist Type", {"Camera LookAt", "Mouse Move"}, 0)
+safeUI(menu.AddSliderInt, "Combat", "Aim Assist", "aim_fov", "Aim FOV Radius (px)", 20, 600, 140, "%d")
+safeUI(menu.AddCheckbox, "Combat", "Aim Assist", "aim_show_fov", "Show FOV Circle", true)
+safeUI(menu.AddSliderFloat, "Combat", "Aim Assist", "aim_smooth", "Aim Smoothing (Higher = Slower)", 1.0, 25.0, 4.0, "%.1f")
 
-    -- Tab 4: Ballistics
-    menu.AddTab("Ballistics", "B")
-    menu.AddGroup("Ballistics", "Weapon & Turret Ballistics")
-    menu.AddCheckbox("Ballistics", "Weapon & Turret Ballistics", "bal_auto", "Auto-Detect Weapon / ZU-23-2", true)
-    menu.AddCheckbox("Ballistics", "Weapon & Turret Ballistics", "bal_comp_shooter", "Compensate Shooter Velocity", true)
-    menu.AddCheckbox("Ballistics", "Weapon & Turret Ballistics", "bal_show_hud", "Show Ballistics HUD", true)
-    menu.AddSeparator("Ballistics", "Weapon & Turret Ballistics")
-    menu.AddSliderInt("Ballistics", "Weapon & Turret Ballistics", "bal_speed", "Manual Bullet Speed", 500, 5000, 1800, "%d studs/s")
-    menu.AddSliderFloat("Ballistics", "Weapon & Turret Ballistics", "bal_drop", "Manual Bullet Drop", 0.0, 200.0, 35.04, "%.2f")
-    menu.AddSliderFloat("Ballistics", "Weapon & Turret Ballistics", "bal_drag", "Manual Bullet Drag", 0.0, 0.001, 0.0, "%.5f")
-end)
+safeUI(menu.AddGroup, "Combat", "Ballistics Engine")
+safeUI(menu.AddCheckbox, "Combat", "Ballistics Engine", "bal_auto", "Auto-Detect Weapon / ZU-23-2", true)
+safeUI(menu.AddCheckbox, "Combat", "Ballistics Engine", "bal_comp_shooter", "Compensate Shooter Velocity", true)
+safeUI(menu.AddCheckbox, "Combat", "Ballistics Engine", "bal_show_hud", "Show Ballistics Telemetry HUD", true)
+safeUI(menu.AddSeparator, "Combat", "Ballistics Engine")
+safeUI(menu.AddSliderInt, "Combat", "Ballistics Engine", "bal_speed", "Manual Bullet Speed", 500, 5000, 1800, "%d")
+safeUI(menu.AddSliderFloat, "Combat", "Ballistics Engine", "bal_drop", "Manual Bullet Drop", 0.0, 200.0, 35.04, "%.2f")
+safeUI(menu.AddSliderFloat, "Combat", "Ballistics Engine", "bal_drag", "Manual Bullet Drag", 0.0, 0.001, 0.0, "%.5f")
+
+-- TAB 2: VISUALS (Drone ESP, Aim Prediction Overlay, Soldier ESP)
+safeUI(menu.AddTab, "Visuals", "V")
+
+safeUI(menu.AddGroup, "Visuals", "Aim Prediction Overlay")
+safeUI(menu.AddCheckbox, "Visuals", "Aim Prediction Overlay", "aim_draw_circle", "Show Lead Prediction Circle", true)
+safeUI(menu.AddCheckbox, "Visuals", "Aim Prediction Overlay", "aim_draw_line", "Show Lead Vector Line", true)
+safeUI(menu.AddCheckbox, "Visuals", "Aim Prediction Overlay", "aim_show_fov_vis", "Show Aim FOV Circle", true)
+safeUI(menu.AddSliderInt, "Visuals", "Aim Prediction Overlay", "aim_quick_fov", "Aim FOV Radius Quick Slider", 20, 600, 140, "%d")
+
+safeUI(menu.AddGroup, "Visuals", "Drone ESP")
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_esp", "Enable Drone ESP", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_box", "Bounding Boxes", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_name", "Model Name", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_pilot", "Pilot Name", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_dist", "Distance", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_vel", "Velocity Tag", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_hp", "Health Bar", true)
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_tracer", "Snaplines (Tracers)", true)
+safeUI(menu.AddCombo, "Visuals", "Drone ESP", "drone_tracer_origin", "Tracer Origin", {"Bottom", "Screen Center", "Mouse"}, 0)
+safeUI(menu.AddSeparator, "Visuals", "Drone ESP")
+safeUI(menu.AddCheckbox, "Visuals", "Drone ESP", "drone_crashed", "Show Crashed / Wrecks", false)
+safeUI(menu.AddSliderInt, "Visuals", "Drone ESP", "drone_max_dist", "Max Drone Distance", 500, 15000, 9000, "%d")
+safeUI(menu.AddSeparator, "Visuals", "Drone ESP")
+safeUI(menu.AddColorpicker, "Visuals", "Drone ESP", "drone_col_enemy", "Enemy Drone Color", {1.0, 0.25, 0.2, 1.0})
+safeUI(menu.AddColorpicker, "Visuals", "Drone ESP", "drone_col_friendly", "Friendly Drone Color", {0.18, 0.8, 0.44, 1.0})
+safeUI(menu.AddColorpicker, "Visuals", "Drone ESP", "drone_col_crashed", "Wreck Color", {0.45, 0.45, 0.5, 1.0})
+
+safeUI(menu.AddGroup, "Visuals", "Soldier ESP")
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_esp", "Enable Soldier ESP", true)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_enemy_only", "Enemies Only (DRG / Opponents)", true)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_box", "Show Boxes", true)
+safeUI(menu.AddCombo, "Visuals", "Soldier ESP", "soldier_box_style", "Box Style", {"Full Box", "Corner Box"}, 1)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_chams", "Player Chams (Native)", false)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_name", "Player Names", true)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_dist", "Distance", true)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_hp", "Health Bar", true)
+safeUI(menu.AddCheckbox, "Visuals", "Soldier ESP", "soldier_tracer", "Tracers", false)
+safeUI(menu.AddSliderInt, "Visuals", "Soldier ESP", "soldier_max_dist", "Max Distance", 200, 6000, 3500, "%d")
+safeUI(menu.AddColorpicker, "Visuals", "Soldier ESP", "soldier_col_enemy", "Enemy Soldier Color", {1.0, 0.28, 0.28, 1.0})
+safeUI(menu.AddColorpicker, "Visuals", "Soldier ESP", "soldier_col_friendly", "Friendly Soldier Color", {0.28, 0.7, 1.0, 1.0})
+
+-- TAB 3: MISC (HUD & Settings)
+safeUI(menu.AddTab, "Misc", "M", "half")
+safeUI(menu.AddGroup, "Misc", "HUD & Telemetry")
+safeUI(menu.AddCheckbox, "Misc", "HUD & Telemetry", "misc_show_hud", "Display Telemetry HUD Window", true)
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE CACHE
@@ -119,7 +135,7 @@ local activeAimTime      = 0
 local isAimTargetLocked  = false
 
 -- ═══════════════════════════════════════════════════════════════════════
--- HELPER UTILITIES
+-- HELPER FUNCTIONS
 -- ═══════════════════════════════════════════════════════════════════════
 local function safeV3(x, y, z)
     if Vector3.New then
@@ -215,7 +231,8 @@ local function loadTRVConfig(cfgName)
 end
 
 local function updateBallistics()
-    if not menu.Get("bal_auto") then
+    local isAuto = menu.Get("bal_auto")
+    if isAuto == false then
         currentBulletSpeed = menu.Get("bal_speed") or DEFAULT_BALLISTIC_SPEED
         currentBulletDrop  = menu.Get("bal_drop") or DEFAULT_BALLISTIC_DROP
         currentBulletDrag  = menu.Get("bal_drag") or 0
@@ -234,7 +251,7 @@ local function updateBallistics()
         return
     end
 
-    -- 1. Turret Mount Detection (e.g. ZU-23-2 Anti-Air Cannon)
+    -- 1. Turret Mount Detection (ZU-23-2 Anti-Air Cannon)
     local hum = lp.Humanoid or (char.FindFirstChildOfClass and char:FindFirstChildOfClass("Humanoid"))
     local seat = hum and hum.SeatPart
     if seat then
@@ -501,18 +518,24 @@ OnFrame = function()
 
     -- Shooter velocity for relative intercept
     local shooterVel = safeV3(0, 0, 0)
-    if menu.Get("bal_comp_shooter") and lp and lp.Velocity then
+    if (menu.Get("bal_comp_shooter") ~= false) and lp and lp.Velocity then
         shooterVel = lp.Velocity
     end
 
-    local aimFovRadius = menu.Get("aim_fov") or 140
-    local isAimEnabled = menu.Get("aim_enabled")
-    local isAimAssistEnabled = menu.Get("aim_assist")
-    local aimVk = menu.GetKey("aim_key") or VK_E
+    -- Dual-bind aim settings (Reads from Combat tab or Visuals overlay quick controls)
+    local isAimEnabled = (menu.Get("aim_enabled") ~= false)
+    local isAimAssistEnabled = (menu.Get("aim_assist") ~= false)
+    local showLeadCircle = (menu.Get("aim_lead_circle") ~= false) and (menu.Get("aim_draw_circle") ~= false)
+    local showLeadLine = (menu.Get("aim_lead_line") ~= false) and (menu.Get("aim_draw_line") ~= false)
+    local showFovCircle = (menu.Get("aim_show_fov") ~= false) and (menu.Get("aim_show_fov_vis") ~= false)
+
+    local aimFovRadius = menu.Get("aim_fov") or menu.Get("aim_quick_fov") or 140
+    local aimVk = menu.GetKey("aim_key")
+    if not aimVk or aimVk == 0 then aimVk = VK_E end
     local isAimKeyDown = input.IsKeyDown(aimVk)
 
     -- Draw FOV Circle
-    if isAimEnabled and menu.Get("aim_show_fov") then
+    if isAimEnabled and showFovCircle then
         local fovCol = isAimTargetLocked and (menu.GetColor("aim_col_locked") or {1, 0.15, 0.15, 0.7})
             or {1.0, 1.0, 1.0, 0.35}
         draw.Circle(cx, cy, aimFovRadius, fovCol, 48, 1.2)
@@ -523,14 +546,14 @@ OnFrame = function()
     -- ─────────────────────────────────────────────────────────────────
     if menu.Get("soldier_esp") then
         local maxSoldierDist = menu.Get("soldier_max_dist") or 3500
-        local enemiesOnly = menu.Get("soldier_enemy_only")
+        local enemiesOnly = menu.Get("soldier_enemy_only") ~= false
         local boxStyle = menu.Get("soldier_box_style") or 1
-        local showBoxes = menu.Get("soldier_box")
-        local showChams = menu.Get("soldier_chams")
-        local showNames = menu.Get("soldier_name")
-        local showDist = menu.Get("soldier_dist")
-        local showHp = menu.Get("soldier_hp")
-        local showTracers = menu.Get("soldier_tracer")
+        local showBoxes = menu.Get("soldier_box") ~= false
+        local showChams = menu.Get("soldier_chams") == true
+        local showNames = menu.Get("soldier_name") ~= false
+        local showDist = menu.Get("soldier_dist") ~= false
+        local showHp = menu.Get("soldier_hp") ~= false
+        local showTracers = menu.Get("soldier_tracer") == true
 
         local enemyColor = menu.GetColor("soldier_col_enemy") or {1.0, 0.28, 0.28, 1.0}
         local friendlyColor = menu.GetColor("soldier_col_friendly") or {0.28, 0.7, 1.0, 1.0}
@@ -597,16 +620,16 @@ OnFrame = function()
     -- ─────────────────────────────────────────────────────────────────
     -- 2. DRONE ESP & KINEMATICS PASS
     -- ─────────────────────────────────────────────────────────────────
-    local isDroneEsp = menu.Get("drone_esp")
-    local showWrecks = menu.Get("drone_crashed")
+    local isDroneEsp = menu.Get("drone_esp") ~= false
+    local showWrecks = menu.Get("drone_crashed") == true
     local maxDroneDist = menu.Get("drone_max_dist") or 9000
-    local showDroneBoxes = menu.Get("drone_box")
-    local showDroneNames = menu.Get("drone_name")
-    local showDronePilots = menu.Get("drone_pilot")
-    local showDroneDist = menu.Get("drone_dist")
-    local showDroneVel = menu.Get("drone_vel")
-    local showDroneHp = menu.Get("drone_hp")
-    local showDroneTracers = menu.Get("drone_tracer")
+    local showDroneBoxes = menu.Get("drone_box") ~= false
+    local showDroneNames = menu.Get("drone_name") ~= false
+    local showDronePilots = menu.Get("drone_pilot") ~= false
+    local showDroneDist = menu.Get("drone_dist") ~= false
+    local showDroneVel = menu.Get("drone_vel") ~= false
+    local showDroneHp = menu.Get("drone_hp") ~= false
+    local showDroneTracers = menu.Get("drone_tracer") ~= false
     local tracerOriginMode = menu.Get("drone_tracer_origin") or 0
 
     local enemyDroneCol = menu.GetColor("drone_col_enemy") or {1.0, 0.25, 0.2, 1.0}
@@ -769,13 +792,13 @@ OnFrame = function()
                                     local isTargetLocked = (bestTargetModel == drone and isAimKeyDown and isAimAssistEnabled)
                                     local curLeadCol = isTargetLocked and lockedAimCol or leadCircleCol
 
-                                    if menu.Get("aim_lead_circle") then
+                                    if showLeadCircle then
                                         draw.Circle(lx, ly, 8, curLeadCol, 24, 2.0)
                                         draw.CircleFilled(lx, ly, 3, curLeadCol, 12)
                                         draw.Text(lx + 10, ly - 6, string.format("%.2fs", tof), curLeadCol, 11)
                                     end
 
-                                    if menu.Get("aim_lead_line") and onScreen then
+                                    if showLeadLine and onScreen then
                                         draw.Line(sx, sy, lx, ly, {curLeadCol[1], curLeadCol[2], curLeadCol[3], 0.55}, 1.2)
                                     end
                                 end
@@ -809,7 +832,8 @@ OnFrame = function()
     -- ─────────────────────────────────────────────────────────────────
     -- 5. BALLISTICS TELEMETRY HUD (draw.Window)
     -- ─────────────────────────────────────────────────────────────────
-    if menu.Get("bal_show_hud") then
+    local showHud = (menu.Get("bal_show_hud") ~= false) and (menu.Get("misc_show_hud") ~= false)
+    if showHud then
         local targetName = activeAimTarget and activeAimTarget.Name or "None"
         local lockStatus = isAimTargetLocked and "[LOCKED]" or (activeAimTarget and "[ACQUIRED]" or "[STANDBY]")
 
@@ -830,5 +854,5 @@ end
 -- INITIAL LOAD NOTIFICATION
 -- ═══════════════════════════════════════════════════════════════════════
 pcall(function()
-    notify.Success("SKYFIRE VECTOR", "Native UI & 2nd-Order Aim Prediction active", 5)
+    notify.Success("SKYFIRE VECTOR", "[Combat] Tab: Aim Prediction & Assist | [Visuals] Tab: ESP", 6)
 end)
