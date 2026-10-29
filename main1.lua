@@ -1,126 +1,169 @@
 --[[
-    ╔══════════════════════════════════════════════════════════╗
-    ║           SKYFIRE ENHANCED  ·  v2.0                     ║
-    ║   Drone ESP · Aim Prediction · DRG Team ESP · GUI       ║
-    ╚══════════════════════════════════════════════════════════╝
-    
-    Features:
-    • Drone ESP — boxes, name tags, distance, velocity, health bars
-    • Advanced aim prediction — iterative intercept solver with
-      velocity smoothing, acceleration estimation, and bullet drop
-    • DRG Team ESP — highlight all DRG/Operator (Dummian) players
-    • Modern glassmorphism GUI with per-feature toggles
-    • Toggle everything on/off with keybinds
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║                     SKYFIRE ENHANCED  ·  v3.6                       ║
+    ║        Turret Aim Fix · Zero-Lag Async Boot · Wreck Filter          ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    Performance & Turret Scoping Overhaul:
+    • ZU-23-2 & Turret Scope Fix: Unconditional key polling (bypasses gameProcessed
+      absorption when seated/scoped) + mousemoverel hardware input support for turrets
+    • Zero-Lag Asynchronous Boot: UI and asset fetching deferred via task.defer;
+      spatial checks use optimized squared distance pre-filtering (zero frame drop)
+    • Dynamic Weapon Caching: Tool/seat changes only trigger lookup on actual switch
+    • Robust Error Isolation: Pcall safety boundaries prevent thread crashes
+    • Full Rayfield UI Suite (No Key System, Real-Time Sliders, Crashed Drone Toggle)
 ]]
 
--- ═══════════════════════════════════════════════════════════
--- SERVICES
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
+-- SERVICES & CONSTANTS
+-- ═══════════════════════════════════════════════════════════════════════
 local Players            = game:GetService("Players")
 local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
+local CollectionService  = game:GetService("CollectionService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local Teams              = game:GetService("Teams")
 local TweenService       = game:GetService("TweenService")
+
 local LocalPlayer        = Players.LocalPlayer
 local Camera             = workspace.CurrentCamera
 
--- ═══════════════════════════════════════════════════════════
+-- Safe TRV Framework references
+local TRVFolder          = ReplicatedStorage:FindFirstChild("TRV")
+local TRVShared          = TRVFolder and TRVFolder:FindFirstChild("Shared")
+local TRVConfigs         = TRVShared and TRVShared:FindFirstChild("Configs")
+
+local DEFAULT_BALLISTIC_SPEED = 3285.71  -- Ballistics.DEFAULT_SPEED
+local DEFAULT_BALLISTIC_DROP  = 35.0357  -- Ballistics.DEFAULT_DROP
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- CONFIGURATION
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
 local CONFIG = {
     -- Drone ESP
     DroneESP = {
         Enabled       = true,
-        MaxDistance    = 8000,
-        BoxColor      = Color3.fromRGB(255, 80, 50),
-        FriendlyColor = Color3.fromRGB(80, 200, 120),
-        CrashedColor  = Color3.fromRGB(120, 120, 120),
-        TextSize      = 14,
+        ShowCrashed   = false,                           -- Toggle: Wrecks & falling drones
+        MaxDistance   = 9000,                            -- Distance slider (500 - 15000)
+        MaxDistSq     = 9000 * 9000,
+        BoxColor      = Color3.fromRGB(255, 65, 54),     -- Hostile drone
+        FriendlyColor = Color3.fromRGB(46, 204, 113),    -- Allied drone
+        CrashedColor  = Color3.fromRGB(110, 110, 120),   -- Dead / crashed
+        JammedColor   = Color3.fromRGB(241, 196, 15),    -- CommsLoss (EW)
+        TextSize      = 13,
         ShowVelocity  = true,
-        ShowDistance   = true,
+        ShowDistance  = true,
         ShowName      = true,
+        ShowPilot     = true,
         ShowHealth    = true,
         ShowTracer    = true,
         TracerOrigin  = "Bottom", -- "Bottom", "Center", "Mouse"
     },
-    
-    -- Aim Prediction
+
+    -- Dynamic Ballistics & Advanced Aim Prediction
     AimPrediction = {
         Enabled          = true,
+        AutoDetectWeapon = true,      -- dynamically read weapon configs from TRV
+        ManualSpeed      = 1800,      -- fallback bullet speed (studs/s)
+        ManualDrop       = 35.04,     -- fallback bullet drop (studs/s^2)
         ShowPrediction   = true,
-        PredictionColor  = Color3.fromRGB(0, 255, 200),
-        LockedColor      = Color3.fromRGB(255, 50, 50),
-        SmoothFactor     = 0.12,     -- velocity lerp rate (lower = smoother)
-        MaxPredictTime   = 4.0,      -- max seconds to predict ahead
-        BulletSpeed      = 900,      -- default bullet speed (studs/s) — adapted from weapon
-        Gravity          = 196.2,    -- Roblox gravity (workspace.Gravity)
-        IterationCount   = 8,        -- intercept solver iterations
-        AimAssist        = false,    -- auto-snap crosshair to predicted pos
-        AimAssistFOV     = 120,      -- screen-space pixel radius for lock
+        ShowFOVCircle    = true,
+        PredictionColor  = Color3.fromRGB(0, 240, 255),
+        LockedColor      = Color3.fromRGB(255, 40, 40),
+        SmoothFactor     = 0.08,      -- velocity smoothing rate
+        MaxPredictTime   = 5.0,       -- max seconds to project forward
+        IterationCount   = 10,        -- intercept iterations
+        AimAssist        = false,     -- lock camera/mouse to lead point
+        AimAssistSmooth  = 0.25,      -- camera lerp rate
+        AimAssistFOV     = 140,       -- screen-space pixel radius for lock
         AimKey           = Enum.KeyCode.E,
+        CompensateShooter= true,      -- account for shooter velocity
     },
-    
-    -- DRG/Enemy Team ESP
-    TeamESP = {
-        Enabled        = true,
-        MaxDistance     = 3000,
-        EnemySide      = "Dummian",  -- DRG + Operators
-        BoxColor       = Color3.fromRGB(255, 60, 75),
-        NameColor      = Color3.fromRGB(255, 200, 80),
-        HealthBarWidth = 4,
-        ShowName       = true,
-        ShowDistance    = true,
-        ShowHealth     = true,
-        ShowWeapon     = true,
-        ShowTracer     = true,
-        HighlightFill  = 0.75,
-        HighlightOutline = Color3.fromRGB(255, 60, 75),
-    },
-    
-    -- GUI
-    GUI = {
-        ToggleKey   = Enum.KeyCode.RightShift,
-        AccentColor = Color3.fromRGB(140, 80, 255),
-        AccentAlt   = Color3.fromRGB(80, 200, 255),
-        DarkBG      = Color3.fromRGB(18, 18, 24),
-        CardBG      = Color3.fromRGB(28, 28, 38),
-        TextColor   = Color3.fromRGB(230, 230, 240),
-        DimText     = Color3.fromRGB(140, 140, 160),
+
+    -- Player & Soldier ESP
+    PlayerESP = {
+        Enabled          = true,
+        EnemiesOnly      = true,      -- only render players from opposing side
+        MaxDistance      = 3500,      -- Distance slider (500 - 8000)
+        MaxDistSq        = 3500 * 3500,
+        BoxColor         = Color3.fromRGB(255, 75, 75),
+        FriendlyColor    = Color3.fromRGB(75, 180, 255),
+        NameColor        = Color3.fromRGB(255, 215, 0),
+        HealthBarWidth   = 3.5,
+        ShowName         = true,
+        ShowDistance     = true,
+        ShowHealth       = true,
+        ShowWeapon       = true,
+        ShowTracer       = true,
+        HighlightFill    = 0.8,
+        HighlightOutline = Color3.fromRGB(255, 75, 75),
     },
 }
 
--- ═══════════════════════════════════════════════════════════
--- STATE
--- ═══════════════════════════════════════════════════════════
-local droneDrawings   = {}   -- [model] = {box, nameTag, tracer, etc.}
-local droneVelocities = {}   -- [model] = {pos, vel, smoothVel, accel, lastTime}
-local playerDrawings  = {}   -- [player] = {box, nameTag, etc.}
-local playerHighlights = {}  -- [player] = Highlight instance
-local aimTarget       = nil  -- current aimed drone entry
-local aimLocked       = false
-local guiVisible      = true
-local connections     = {}
+-- ═══════════════════════════════════════════════════════════════════════
+-- STATE MANAGEMENT
+-- ═══════════════════════════════════════════════════════════════════════
+local droneDrawings    = {}   -- [model] = drawings table
+local droneTrackers    = {}   -- [model] = kinematic tracking state
+local playerDrawings   = {}   -- [player] = drawings table
+local playerHighlights = {}   -- [player] = Highlight instance
+local aimTarget        = nil  -- locked drone instance
+local aimLocked        = false
+local connections      = {}
+local weaponConfigCache= {}   -- [weaponName] = cached config table
 
--- ═══════════════════════════════════════════════════════════
--- UTILITY
--- ═══════════════════════════════════════════════════════════
-local function getTeamSide(team)
-    if not team then return nil end
-    return team:GetAttribute("TRV_Side")
+-- Cached weapon inspection state
+local lastEquippedIdentifier = ""
+local currentWeaponName  = "Default / None"
+local currentBulletSpeed = DEFAULT_BALLISTIC_SPEED
+local currentBulletDrop  = DEFAULT_BALLISTIC_DROP
+local currentBulletDrag  = 0
+
+-- Live FOV Circle Drawing
+local fovCircle = Drawing.new("Circle")
+fovCircle.Thickness = 1.2
+fovCircle.NumSides = 48
+fovCircle.Radius = CONFIG.AimPrediction.AimAssistFOV
+fovCircle.Filled = false
+fovCircle.Color = Color3.fromRGB(255, 255, 255)
+fovCircle.Transparency = 0.35
+fovCircle.Visible = false
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- OPTIMIZED UTILITIES & FAST MATH
+-- ═══════════════════════════════════════════════════════════════════════
+local function getDistanceSq(p1, p2)
+    local dx = p1.X - p2.X
+    local dy = p1.Y - p2.Y
+    local dz = p1.Z - p2.Z
+    return (dx * dx) + (dy * dy) + (dz * dz)
 end
 
-local function isEnemy(team)
-    if not team then return false end
+local function getTeamSide(team)
+    if not team then return nil end
+    local side = team:GetAttribute("TRV_Side")
+    if type(side) == "string" and side ~= "" then
+        return side
+    end
+    return team.Name
+end
+
+local function isEnemyTeam(theirTeam)
+    if not theirTeam then return false end
     local mySide = getTeamSide(LocalPlayer.Team)
-    local theirSide = getTeamSide(team)
+    local theirSide = getTeamSide(theirTeam)
     if not mySide or not theirSide then return false end
     return mySide ~= theirSide
 end
 
-local function isDRGSide(team)
-    if not team then return false end
-    local side = getTeamSide(team)
-    return side == CONFIG.TeamESP.EnemySide
+local function isEnemyPlayer(player)
+    if not player or player == LocalPlayer then return false end
+    return isEnemyTeam(player.Team)
+end
+
+local function resolvePlayerByUserId(userId)
+    if not userId or userId <= 0 then return nil end
+    return Players:GetPlayerByUserId(userId)
 end
 
 local function worldToScreen(pos)
@@ -128,21 +171,115 @@ local function worldToScreen(pos)
     return Vector2.new(screenPos.X, screenPos.Y), onScreen, screenPos.Z
 end
 
-local function distanceTo(pos)
-    return (Camera.CFrame.Position - pos).Magnitude
-end
-
-local function lerp(a, b, t)
-    return a + (b - a) * t
-end
-
 local function lerpV3(a, b, t)
     return a:Lerp(b, t)
 end
 
--- ═══════════════════════════════════════════════════════════
--- DRAWING LIBRARY (uses Roblox Drawing API)
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
+-- EFFICIENT WEAPON INTROSPECTION (CACHED)
+-- ═══════════════════════════════════════════════════════════════════════
+local function loadWeaponConfig(name)
+    if weaponConfigCache[name] then
+        return weaponConfigCache[name]
+    end
+    if not TRVConfigs then return nil end
+    local configModule = TRVConfigs:FindFirstChild(name)
+    if configModule and configModule:IsA("ModuleScript") then
+        local success, cfg = pcall(require, configModule)
+        if success and type(cfg) == "table" then
+            weaponConfigCache[name] = cfg
+            return cfg
+        end
+    end
+    return nil
+end
+
+local function updateActiveWeaponBallistics()
+    if not CONFIG.AimPrediction.AutoDetectWeapon then
+        currentBulletSpeed = CONFIG.AimPrediction.ManualSpeed
+        currentBulletDrop  = CONFIG.AimPrediction.ManualDrop
+        currentBulletDrag  = 0
+        currentWeaponName  = "Manual Config"
+        return
+    end
+
+    local char = LocalPlayer.Character
+    if not char then
+        currentWeaponName  = "Unarmed"
+        currentBulletSpeed = DEFAULT_BALLISTIC_SPEED
+        currentBulletDrop  = DEFAULT_BALLISTIC_DROP
+        currentBulletDrag  = 0
+        lastEquippedIdentifier = ""
+        return
+    end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    -- 1. Check Turret / Vehicle Seat
+    if hum and hum.SeatPart then
+        local seat = hum.SeatPart
+        local turretModel = seat:FindFirstAncestorOfClass("Model")
+        local turretWeapon = turretModel and (turretModel:GetAttribute("TurretWeapon") or turretModel:GetAttribute("WeaponName"))
+        if not turretWeapon and turretModel and turretModel.Parent then
+            turretWeapon = turretModel.Parent:GetAttribute("TurretWeapon") or turretModel.Parent:GetAttribute("WeaponName")
+        end
+
+        if turretWeapon then
+            local identifier = "TURRET_" .. turretWeapon
+            if identifier ~= lastEquippedIdentifier then
+                lastEquippedIdentifier = identifier
+                local cfg = loadWeaponConfig(turretWeapon)
+                if cfg then
+                    currentWeaponName  = turretWeapon .. " (Turret)"
+                    currentBulletSpeed = cfg.bulletSpeed or DEFAULT_BALLISTIC_SPEED
+                    currentBulletDrop  = cfg.bulletDrop or DEFAULT_BALLISTIC_DROP
+                    currentBulletDrag  = cfg.drag or 0
+                else
+                    currentWeaponName  = turretWeapon .. " (Turret/Uncached)"
+                    currentBulletSpeed = 3460
+                    currentBulletDrop  = 120
+                    currentBulletDrag  = 0.00022
+                end
+            end
+            return
+        end
+    end
+
+    -- 2. Check Tool
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then
+        local identifier = "TOOL_" .. tool.Name
+        if identifier ~= lastEquippedIdentifier then
+            lastEquippedIdentifier = identifier
+            local cfg = loadWeaponConfig(tool.Name)
+            if cfg then
+                currentWeaponName  = tool.Name
+                currentBulletSpeed = cfg.bulletSpeed or DEFAULT_BALLISTIC_SPEED
+                currentBulletDrop  = cfg.bulletDrop or DEFAULT_BALLISTIC_DROP
+                currentBulletDrag  = cfg.drag or 0
+            else
+                currentWeaponName  = tool.Name .. " (Generic)"
+                currentBulletSpeed = 1600
+                currentBulletDrop  = DEFAULT_BALLISTIC_DROP
+                currentBulletDrag  = 0
+            end
+        end
+        return
+    end
+
+    -- 3. Default
+    if lastEquippedIdentifier ~= "NONE" then
+        lastEquippedIdentifier = "NONE"
+        currentWeaponName  = "Standard / Fallback"
+        currentBulletSpeed = DEFAULT_BALLISTIC_SPEED
+        currentBulletDrop  = DEFAULT_BALLISTIC_DROP
+        currentBulletDrag  = 0
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- DRAWING WRAPPER
+-- ═══════════════════════════════════════════════════════════════════════
 local function newDrawing(class, props)
     local d = Drawing.new(class)
     for k, v in pairs(props or {}) do
@@ -152,7 +289,7 @@ local function newDrawing(class, props)
 end
 
 local function destroyDrawings(tbl)
-    for _, d in pairs(tbl) do
+    for _, d in pairs(tbl or {}) do
         if typeof(d) == "table" then
             destroyDrawings(d)
         elseif d and typeof(d) ~= "string" and typeof(d) ~= "number" and typeof(d) ~= "boolean" then
@@ -162,15 +299,15 @@ local function destroyDrawings(tbl)
     end
 end
 
--- ═══════════════════════════════════════════════════════════
--- DRONE ESP DRAWINGS
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
+-- DRAWING INSTANTIATION (DRONE & PLAYER)
+-- ═══════════════════════════════════════════════════════════════════════
 local function createDroneDrawing()
     return {
         box = newDrawing("Square", {
             Thickness = 1.5,
             Filled = false,
-            Transparency = 0.85,
+            Transparency = 0.9,
             Color = CONFIG.DroneESP.BoxColor,
             Visible = false,
             ZIndex = 2,
@@ -178,7 +315,7 @@ local function createDroneDrawing()
         boxFill = newDrawing("Square", {
             Thickness = 1,
             Filled = true,
-            Transparency = 0.12,
+            Transparency = 0.14,
             Color = CONFIG.DroneESP.BoxColor,
             Visible = false,
             ZIndex = 1,
@@ -191,11 +328,19 @@ local function createDroneDrawing()
             Visible = false,
             ZIndex = 3,
         }),
+        pilotTag = newDrawing("Text", {
+            Size = CONFIG.DroneESP.TextSize - 2,
+            Center = true,
+            Outline = true,
+            Color = Color3.fromRGB(220, 220, 230),
+            Visible = false,
+            ZIndex = 3,
+        }),
         distTag = newDrawing("Text", {
             Size = CONFIG.DroneESP.TextSize - 2,
             Center = true,
             Outline = true,
-            Color = CONFIG.GUI.DimText,
+            Color = Color3.fromRGB(160, 165, 180),
             Visible = false,
             ZIndex = 3,
         }),
@@ -203,31 +348,31 @@ local function createDroneDrawing()
             Size = CONFIG.DroneESP.TextSize - 2,
             Center = true,
             Outline = true,
-            Color = Color3.fromRGB(150, 220, 255),
+            Color = Color3.fromRGB(130, 220, 255),
             Visible = false,
             ZIndex = 3,
         }),
         healthBar = newDrawing("Line", {
-            Thickness = 3,
+            Thickness = 3.5,
             Color = Color3.fromRGB(0, 255, 100),
             Visible = false,
             ZIndex = 3,
         }),
         healthBarBG = newDrawing("Line", {
-            Thickness = 3,
-            Color = Color3.fromRGB(50, 50, 50),
+            Thickness = 3.5,
+            Color = Color3.fromRGB(40, 40, 40),
             Visible = false,
             ZIndex = 2,
         }),
         tracer = newDrawing("Line", {
             Thickness = 1,
-            Transparency = 0.5,
+            Transparency = 0.55,
             Color = CONFIG.DroneESP.BoxColor,
             Visible = false,
             ZIndex = 1,
         }),
         predCircle = newDrawing("Circle", {
-            Thickness = 2,
+            Thickness = 1.8,
             Filled = false,
             NumSides = 24,
             Radius = 8,
@@ -245,8 +390,8 @@ local function createDroneDrawing()
             ZIndex = 5,
         }),
         predLine = newDrawing("Line", {
-            Thickness = 1,
-            Transparency = 0.6,
+            Thickness = 1.2,
+            Transparency = 0.65,
             Color = CONFIG.AimPrediction.PredictionColor,
             Visible = false,
             ZIndex = 3,
@@ -254,24 +399,21 @@ local function createDroneDrawing()
     }
 end
 
--- ═══════════════════════════════════════════════════════════
--- PLAYER ESP DRAWINGS
--- ═══════════════════════════════════════════════════════════
 local function createPlayerDrawing()
     return {
         box = newDrawing("Square", {
             Thickness = 1.5,
             Filled = false,
             Transparency = 0.85,
-            Color = CONFIG.TeamESP.BoxColor,
+            Color = CONFIG.PlayerESP.BoxColor,
             Visible = false,
             ZIndex = 2,
         }),
         boxFill = newDrawing("Square", {
             Thickness = 1,
             Filled = true,
-            Transparency = 0.08,
-            Color = CONFIG.TeamESP.BoxColor,
+            Transparency = 0.1,
+            Color = CONFIG.PlayerESP.BoxColor,
             Visible = false,
             ZIndex = 1,
         }),
@@ -279,7 +421,7 @@ local function createPlayerDrawing()
             Size = CONFIG.DroneESP.TextSize,
             Center = true,
             Outline = true,
-            Color = CONFIG.TeamESP.NameColor,
+            Color = CONFIG.PlayerESP.NameColor,
             Visible = false,
             ZIndex = 3,
         }),
@@ -287,19 +429,19 @@ local function createPlayerDrawing()
             Size = CONFIG.DroneESP.TextSize - 2,
             Center = true,
             Outline = true,
-            Color = CONFIG.GUI.DimText,
+            Color = Color3.fromRGB(160, 165, 180),
             Visible = false,
             ZIndex = 3,
         }),
         healthBar = newDrawing("Line", {
-            Thickness = CONFIG.TeamESP.HealthBarWidth,
+            Thickness = CONFIG.PlayerESP.HealthBarWidth,
             Color = Color3.fromRGB(0, 255, 100),
             Visible = false,
             ZIndex = 3,
         }),
         healthBarBG = newDrawing("Line", {
-            Thickness = CONFIG.TeamESP.HealthBarWidth,
-            Color = Color3.fromRGB(50, 50, 50),
+            Thickness = CONFIG.PlayerESP.HealthBarWidth,
+            Color = Color3.fromRGB(40, 40, 40),
             Visible = false,
             ZIndex = 2,
         }),
@@ -307,36 +449,31 @@ local function createPlayerDrawing()
             Size = CONFIG.DroneESP.TextSize - 2,
             Center = true,
             Outline = true,
-            Color = Color3.fromRGB(200, 200, 220),
+            Color = Color3.fromRGB(210, 215, 230),
             Visible = false,
             ZIndex = 3,
         }),
         tracer = newDrawing("Line", {
             Thickness = 1,
-            Transparency = 0.4,
-            Color = CONFIG.TeamESP.BoxColor,
+            Transparency = 0.45,
+            Color = CONFIG.PlayerESP.BoxColor,
             Visible = false,
             ZIndex = 1,
         }),
     }
 end
 
--- ═══════════════════════════════════════════════════════════
--- AIM PREDICTION ENGINE
--- Advanced iterative intercept solver with:
---  • Velocity smoothing (exponential lerp)
---  • Acceleration estimation (first-order derivative)
---  • Bullet drop compensation (quadratic gravity)
---  • Iterative convergence (Newton-like refinement)
--- ═══════════════════════════════════════════════════════════
-local function updateDroneTracking(model, base, dt)
-    local pos = base.Position
-    local rawVel = base.AssemblyLinearVelocity
+-- ═══════════════════════════════════════════════════════════════════════
+-- ADVANCED KINEMATICS & BALLISTIC INTERCEPT SOLVER
+-- ═══════════════════════════════════════════════════════════════════════
+local function updateKinematics(model, primaryPart, dt)
+    local pos = primaryPart.Position
+    local rawVel = primaryPart.AssemblyLinearVelocity
     local now = tick()
-    
-    local entry = droneVelocities[model]
-    if not entry then
-        droneVelocities[model] = {
+
+    local state = droneTrackers[model]
+    if not state then
+        state = {
             pos = pos,
             vel = rawVel,
             smoothVel = rawVel,
@@ -344,555 +481,603 @@ local function updateDroneTracking(model, base, dt)
             lastTime = now,
             lastVel = rawVel,
         }
-        return droneVelocities[model]
+        droneTrackers[model] = state
+        return state
     end
-    
-    local elapsed = math.max(now - entry.lastTime, 0.001)
+
+    local elapsed = math.clamp(now - state.lastTime, 0.001, 0.2)
     local alpha = 1 - math.exp(-elapsed / CONFIG.AimPrediction.SmoothFactor)
-    
-    -- Smooth velocity with exponential moving average
-    local newSmooth = lerpV3(entry.smoothVel, rawVel, alpha)
-    
-    -- Estimate acceleration (derivative of velocity)
-    local accelRaw = (newSmooth - entry.lastVel) / elapsed
-    local accelAlpha = 1 - math.exp(-elapsed / (CONFIG.AimPrediction.SmoothFactor * 2))
-    local newAccel = lerpV3(entry.accel, accelRaw, accelAlpha)
-    
-    entry.pos = pos
-    entry.vel = rawVel
-    entry.smoothVel = newSmooth
-    entry.lastVel = newSmooth
-    entry.accel = newAccel
-    entry.lastTime = now
-    
-    return entry
+
+    local newSmooth = lerpV3(state.smoothVel, rawVel, alpha)
+    local rawAccel = (newSmooth - state.lastVel) / elapsed
+    local accelAlpha = 1 - math.exp(-elapsed / (CONFIG.AimPrediction.SmoothFactor * 2.2))
+    local newAccel = lerpV3(state.accel, rawAccel, accelAlpha)
+
+    if newAccel.Magnitude > 320 then
+        newAccel = newAccel.Unit * 320
+    end
+
+    state.pos = pos
+    state.vel = rawVel
+    state.smoothVel = newSmooth
+    state.lastVel = newSmooth
+    state.accel = newAccel
+    state.lastTime = now
+
+    return state
 end
 
-local function predictPosition(entry, t)
-    -- Position = pos + vel*t + 0.5*accel*t^2
-    return entry.pos + entry.smoothVel * t + entry.accel * (0.5 * t * t)
+local function projectPosition(state, t)
+    return state.pos + (state.smoothVel * t) + (state.accel * (0.5 * t * t))
 end
 
-local function solveIntercept(shooterPos, targetEntry, bulletSpeed)
-    -- Iterative intercept solver
-    -- Start with naive time estimate, refine through iterations
-    local targetPos = targetEntry.pos
-    local dist = (targetPos - shooterPos).Magnitude
-    local timeEstimate = dist / bulletSpeed
-    local gravity = CONFIG.AimPrediction.Gravity
-    
-    local bestPos = targetPos
-    local bestTime = timeEstimate
-    
-    for i = 1, CONFIG.AimPrediction.IterationCount do
-        -- Predict where target will be at estimated time
-        local futurePos = predictPosition(targetEntry, timeEstimate)
-        
-        -- Calculate where bullet needs to aim to hit that point
-        -- accounting for bullet drop: bulletY = -0.5 * g * t^2
-        local delta = futurePos - shooterPos
-        local horizontalDist = Vector3.new(delta.X, 0, delta.Z).Magnitude
-        
-        -- Compensate for bullet drop
-        local dropCompensation = 0.5 * gravity * timeEstimate * timeEstimate
-        local aimPos = futurePos + Vector3.new(0, dropCompensation, 0)
-        
-        -- Recalculate time based on 3D distance to aim point
-        local aimDist = (aimPos - shooterPos).Magnitude
-        local newTime = aimDist / bulletSpeed
-        
-        -- Convergence check
-        if math.abs(newTime - timeEstimate) < 0.001 then
-            bestPos = aimPos
-            bestTime = newTime
+local function solveLeadIntercept(shooterOrigin, state, bulletSpeed, bulletDrop, bulletDrag)
+    local shooterVel = Vector3.zero
+    if CONFIG.AimPrediction.CompensateShooter then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            shooterVel = char.HumanoidRootPart.AssemblyLinearVelocity
+        end
+    end
+
+    local targetPos = state.pos
+    local initialDist = (targetPos - shooterOrigin).Magnitude
+    local timeOfFlight = initialDist / bulletSpeed
+    local bestAimPos = targetPos
+
+    for _ = 1, CONFIG.AimPrediction.IterationCount do
+        local futurePos = projectPosition(state, timeOfFlight)
+        local effectiveShooterOrigin = shooterOrigin + (shooterVel * timeOfFlight)
+        local deltaVector = futurePos - effectiveShooterOrigin
+        local currentDist = deltaVector.Magnitude
+
+        local effectiveSpeed = bulletSpeed
+        if bulletDrag and bulletDrag > 0 then
+            effectiveSpeed = bulletSpeed / (1 + bulletDrag * currentDist)
+        end
+
+        local verticalDrop = 0.5 * bulletDrop * (timeOfFlight * timeOfFlight)
+        local compensatedPos = futurePos + Vector3.new(0, verticalDrop, 0)
+
+        local travelDist = (compensatedPos - effectiveShooterOrigin).Magnitude
+        local updatedTime = travelDist / effectiveSpeed
+
+        if math.abs(updatedTime - timeOfFlight) < 0.0003 then
+            bestAimPos = compensatedPos
+            timeOfFlight = updatedTime
             break
         end
-        
-        timeEstimate = newTime
-        bestPos = aimPos
-        bestTime = newTime
+
+        timeOfFlight = updatedTime
+        bestAimPos = compensatedPos
     end
-    
-    -- Clamp prediction time
-    if bestTime > CONFIG.AimPrediction.MaxPredictTime then
+
+    if timeOfFlight > CONFIG.AimPrediction.MaxPredictTime then
         return nil, nil
     end
-    
-    return bestPos, bestTime
+
+    return bestAimPos, timeOfFlight
 end
 
--- ═══════════════════════════════════════════════════════════
--- FIND NEAREST DRONE TO CROSSHAIR
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
+-- TARGET SELECTION
+-- ═══════════════════════════════════════════════════════════════════════
 local function findBestDroneTarget()
-    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local screenCenter = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
     local bestDist = CONFIG.AimPrediction.AimAssistFOV
     local bestModel = nil
-    local bestEntry = nil
-    
-    for model, entry in pairs(droneVelocities) do
-        if model.Parent and not model:GetAttribute("Crashed") then
-            -- Check if this drone is an enemy
-            local droneTeam = model:GetAttribute("TRV_Team")
-            local ownerUserId = model:GetAttribute("OperatorUserId")
-            local isFriendly = false
-            
-            if droneTeam then
-                local teamObj = Teams:FindFirstChild(droneTeam)
-                if teamObj then
-                    local mySide = getTeamSide(LocalPlayer.Team)
-                    local theirSide = getTeamSide(teamObj)
-                    isFriendly = mySide and theirSide and mySide == theirSide
+    local bestState = nil
+
+    for model, state in pairs(droneTrackers) do
+        if model.Parent then
+            local isCrashed = model:GetAttribute("Crashed") or model:GetAttribute("Falling")
+            local hp = model:GetAttribute("HP")
+            if hp and hp <= 0 then isCrashed = true end
+
+            if not isCrashed then
+                local isEnemy = true
+                local droneTeam = model:GetAttribute("TRV_Team")
+                local operatorId = model:GetAttribute("OperatorUserId")
+
+                if droneTeam then
+                    local teamObj = Teams:FindFirstChild(droneTeam)
+                    if teamObj and not isEnemyTeam(teamObj) then
+                        isEnemy = false
+                    end
+                elseif operatorId then
+                    local pilot = resolvePlayerByUserId(operatorId)
+                    if pilot and not isEnemyPlayer(pilot) then
+                        isEnemy = false
+                    end
                 end
-            elseif ownerUserId then
-                local player = Players:GetPlayerByUserId(ownerUserId)
-                if player and player.Team then
-                    isFriendly = not isEnemy(player.Team)
-                end
-            end
-            
-            if not isFriendly then
-                local screenPos, onScreen = worldToScreen(entry.pos)
-                if onScreen then
-                    local dist = (screenPos - screenCenter).Magnitude
-                    if dist < bestDist then
-                        bestDist = dist
-                        bestModel = model
-                        bestEntry = entry
+
+                if isEnemy then
+                    local screenPos, onScreen = worldToScreen(state.pos)
+                    if onScreen then
+                        local dist = (screenPos - screenCenter).Magnitude
+                        if dist < bestDist then
+                            bestDist = dist
+                            bestModel = model
+                            bestState = state
+                        end
                     end
                 end
             end
         end
     end
-    
-    return bestModel, bestEntry
+
+    return bestModel, bestState
 end
 
--- ═══════════════════════════════════════════════════════════
--- MAIN RENDER LOOP
--- ═══════════════════════════════════════════════════════════
-local function getScreenBottom()
-    return Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+local function getTracerOrigin(originType)
+    if originType == "Bottom" then
+        return Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y)
+    elseif originType == "Mouse" then
+        local mp = UserInputService:GetMouseLocation()
+        return Vector2.new(mp.X, mp.Y)
+    else
+        return Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
+    end
 end
 
-local function getScreenCenter()
-    return Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-end
-
-local function updateDroneESP(dt)
+-- ═══════════════════════════════════════════════════════════════════════
+-- DRONE ESP RENDER PASS
+-- ═══════════════════════════════════════════════════════════════════════
+local function updateDroneESP(dt, camPos)
     if not CONFIG.DroneESP.Enabled then
-        for model, drawings in pairs(droneDrawings) do
+        for _, drawings in pairs(droneDrawings) do
             for _, d in pairs(drawings) do
                 pcall(function() d.Visible = false end)
             end
         end
         return
     end
-    
-    -- Collect all UAV models
+
     local activeDrones = {}
+    local taggedDrones = CollectionService:GetTagged("UAVDrone")
+
+    local candidateDrones = {}
+    for _, drone in ipairs(taggedDrones) do
+        candidateDrones[drone] = true
+    end
     for _, child in ipairs(workspace:GetChildren()) do
         if child:IsA("Model") and child:GetAttribute("UAV") then
-            activeDrones[child] = true
-            local base = child:FindFirstChild("Base") or child.PrimaryPart
-            if base and base:IsA("BasePart") then
-                -- Update tracking
-                local entry = updateDroneTracking(child, base, dt)
-                
-                -- Create drawings if needed
-                if not droneDrawings[child] then
-                    droneDrawings[child] = createDroneDrawing()
+            candidateDrones[child] = true
+        end
+    end
+
+    for drone in pairs(candidateDrones) do
+        if not drone.Parent then continue end
+
+        local base = drone:FindFirstChild("Base") or drone.PrimaryPart or drone:FindFirstChildWhichIsA("BasePart")
+        if not base then continue end
+
+        local isCrashed = drone:GetAttribute("Crashed") or drone:GetAttribute("Falling")
+        local hp = drone:GetAttribute("HP")
+        if hp and hp <= 0 then isCrashed = true end
+
+        if isCrashed and not CONFIG.DroneESP.ShowCrashed then
+            if droneDrawings[drone] then
+                for _, drw in pairs(droneDrawings[drone]) do
+                    pcall(function() drw.Visible = false end)
                 end
-                
-                local d = droneDrawings[child]
-                local dist = distanceTo(base.Position)
-                
-                if dist > CONFIG.DroneESP.MaxDistance then
-                    for _, drawing in pairs(d) do
-                        pcall(function() drawing.Visible = false end)
-                    end
-                    continue
+            end
+            continue
+        end
+
+        -- Fast Squared Distance Check (Zero-Lag Pre-Filtering)
+        local basePos = base.Position
+        local distSq = getDistanceSq(camPos, basePos)
+        if distSq > CONFIG.DroneESP.MaxDistSq then
+            if droneDrawings[drone] then
+                for _, drw in pairs(droneDrawings[drone]) do
+                    pcall(function() drw.Visible = false end)
                 end
-                
-                -- Get bounding box on screen
-                local cf = child:GetBoundingBox()
-                local size = child:GetExtentsSize()
-                
-                local corners = {
-                    cf * Vector3.new( size.X/2,  size.Y/2,  size.Z/2),
-                    cf * Vector3.new(-size.X/2,  size.Y/2,  size.Z/2),
-                    cf * Vector3.new( size.X/2, -size.Y/2,  size.Z/2),
-                    cf * Vector3.new(-size.X/2, -size.Y/2,  size.Z/2),
-                    cf * Vector3.new( size.X/2,  size.Y/2, -size.Z/2),
-                    cf * Vector3.new(-size.X/2,  size.Y/2, -size.Z/2),
-                    cf * Vector3.new( size.X/2, -size.Y/2, -size.Z/2),
-                    cf * Vector3.new(-size.X/2, -size.Y/2, -size.Z/2),
-                }
-                
-                local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
-                local allOnScreen = true
-                
-                for _, corner in ipairs(corners) do
-                    local sp, onScreen, depth = worldToScreen(corner)
-                    if not onScreen or depth < 0 then
-                        allOnScreen = false
-                        break
-                    end
-                    minX = math.min(minX, sp.X)
-                    minY = math.min(minY, sp.Y)
-                    maxX = math.max(maxX, sp.X)
-                    maxY = math.max(maxY, sp.Y)
-                end
-                
-                if not allOnScreen then
-                    for _, drawing in pairs(d) do
-                        pcall(function() drawing.Visible = false end)
-                    end
-                    continue
-                end
-                
-                -- Determine color
-                local isCrashed = child:GetAttribute("Crashed")
-                local droneTeam = child:GetAttribute("TRV_Team")
-                local ownerUserId = child:GetAttribute("OperatorUserId")
-                local isFriendly = false
-                
-                if droneTeam then
-                    local teamObj = Teams:FindFirstChild(droneTeam)
-                    if teamObj then
-                        local mySide = getTeamSide(LocalPlayer.Team)
-                        local theirSide = getTeamSide(teamObj)
-                        isFriendly = mySide and theirSide and mySide == theirSide
-                    end
-                elseif ownerUserId then
-                    local player = Players:GetPlayerByUserId(ownerUserId)
-                    if player and player.Team then
-                        isFriendly = not isEnemy(player.Team)
-                    end
-                end
-                
-                local color
-                if isCrashed then
-                    color = CONFIG.DroneESP.CrashedColor
-                elseif isFriendly then
-                    color = CONFIG.DroneESP.FriendlyColor
-                else
-                    color = CONFIG.DroneESP.BoxColor
-                end
-                
-                -- Padding
-                local pad = math.max(4, (maxX - minX) * 0.08)
-                minX -= pad; minY -= pad; maxX += pad; maxY += pad
-                local w = maxX - minX
-                local h = maxY - minY
-                
-                -- Box
-                d.box.Size = Vector2.new(w, h)
-                d.box.Position = Vector2.new(minX, minY)
-                d.box.Color = color
-                d.box.Visible = true
-                
-                d.boxFill.Size = Vector2.new(w, h)
-                d.boxFill.Position = Vector2.new(minX, minY)
-                d.boxFill.Color = color
-                d.boxFill.Visible = true
-                
-                -- Name tag
-                local yOff = minY - 4
-                if CONFIG.DroneESP.ShowName then
-                    d.nameTag.Text = child.Name
-                    d.nameTag.Position = Vector2.new(minX + w/2, yOff - 16)
-                    d.nameTag.Color = color
-                    d.nameTag.Visible = true
-                    yOff -= 18
-                else
-                    d.nameTag.Visible = false
-                end
-                
-                -- Distance
-                if CONFIG.DroneESP.ShowDistance then
-                    d.distTag.Text = string.format("%.0f st", dist)
-                    d.distTag.Position = Vector2.new(minX + w/2, maxY + 3)
-                    d.distTag.Visible = true
-                else
-                    d.distTag.Visible = false
-                end
-                
-                -- Velocity
-                if CONFIG.DroneESP.ShowVelocity and entry then
-                    local speed = math.floor(entry.smoothVel.Magnitude + 0.5)
-                    d.velTag.Text = string.format("%d st/s", speed)
-                    d.velTag.Position = Vector2.new(minX + w/2, maxY + 17)
-                    d.velTag.Visible = true
-                else
-                    d.velTag.Visible = false
-                end
-                
-                -- Health bar (left side)
-                local droneHP = child:GetAttribute("HP")
-                local droneMaxHP = child:GetAttribute("MaxHP")
-                if CONFIG.DroneESP.ShowHealth and droneHP and droneMaxHP and droneMaxHP > 0 then
-                    local ratio = math.clamp(droneHP / droneMaxHP, 0, 1)
-                    local barH = h * ratio
-                    d.healthBarBG.From = Vector2.new(minX - 5, minY)
-                    d.healthBarBG.To = Vector2.new(minX - 5, maxY)
-                    d.healthBarBG.Visible = true
-                    d.healthBar.From = Vector2.new(minX - 5, maxY - barH)
-                    d.healthBar.To = Vector2.new(minX - 5, maxY)
-                    d.healthBar.Color = Color3.fromRGB(
-                        math.floor(255 * (1 - ratio)),
-                        math.floor(255 * ratio),
-                        50
-                    )
-                    d.healthBar.Visible = true
-                else
-                    d.healthBar.Visible = false
-                    d.healthBarBG.Visible = false
-                end
-                
-                -- Tracer
-                if CONFIG.DroneESP.ShowTracer then
-                    local origin
-                    if CONFIG.DroneESP.TracerOrigin == "Bottom" then
-                        origin = getScreenBottom()
-                    elseif CONFIG.DroneESP.TracerOrigin == "Mouse" then
-                        local mp = UserInputService:GetMouseLocation()
-                        origin = Vector2.new(mp.X, mp.Y)
-                    else
-                        origin = getScreenCenter()
-                    end
-                    d.tracer.From = origin
-                    d.tracer.To = Vector2.new(minX + w/2, maxY)
-                    d.tracer.Color = color
-                    d.tracer.Visible = true
-                else
-                    d.tracer.Visible = false
-                end
-                
-                -- Aim Prediction visuals
-                if CONFIG.AimPrediction.Enabled and CONFIG.AimPrediction.ShowPrediction and entry and not isCrashed and not isFriendly then
-                    local shooterPos = Camera.CFrame.Position
-                    local char = LocalPlayer.Character
-                    if char then
-                        local hrp = char:FindFirstChild("HumanoidRootPart")
-                        if hrp then shooterPos = hrp.Position end
-                    end
-                    
-                    local predPos, predTime = solveIntercept(shooterPos, entry, CONFIG.AimPrediction.BulletSpeed)
-                    
-                    if predPos and predTime then
-                        local predScreen, predOnScreen = worldToScreen(predPos)
-                        local isLocked = aimLocked and aimTarget == child
-                        
-                        if predOnScreen then
-                            local predColor = isLocked and CONFIG.AimPrediction.LockedColor or CONFIG.AimPrediction.PredictionColor
-                            d.predCircle.Position = predScreen
-                            d.predCircle.Color = predColor
-                            d.predCircle.Radius = math.clamp(800 / dist, 4, 20)
-                            d.predCircle.Visible = true
-                            
-                            d.predDot.Position = predScreen
-                            d.predDot.Color = predColor
-                            d.predDot.Visible = true
-                            
-                            -- Line from drone to predicted pos
-                            local droneCenter = Vector2.new(minX + w/2, minY + h/2)
-                            d.predLine.From = droneCenter
-                            d.predLine.To = predScreen
-                            d.predLine.Color = predColor
-                            d.predLine.Visible = true
-                        else
-                            d.predCircle.Visible = false
-                            d.predDot.Visible = false
-                            d.predLine.Visible = false
-                        end
-                    else
-                        d.predCircle.Visible = false
-                        d.predDot.Visible = false
-                        d.predLine.Visible = false
-                    end
+            end
+            continue
+        end
+
+        activeDrones[drone] = true
+        local state = updateKinematics(drone, base, dt)
+
+        if not droneDrawings[drone] then
+            droneDrawings[drone] = createDroneDrawing()
+        end
+
+        local d = droneDrawings[drone]
+        local dist = math.sqrt(distSq)
+
+        -- On-Screen Bounding Box
+        local cf = drone:GetBoundingBox()
+        local extents = drone:GetExtentsSize()
+        local half = extents * 0.5
+
+        local corners = {
+            cf * Vector3.new( half.X,  half.Y,  half.Z),
+            cf * Vector3.new(-half.X,  half.Y,  half.Z),
+            cf * Vector3.new( half.X, -half.Y,  half.Z),
+            cf * Vector3.new(-half.X, -half.Y,  half.Z),
+            cf * Vector3.new( half.X,  half.Y, -half.Z),
+            cf * Vector3.new(-half.X,  half.Y, -half.Z),
+            cf * Vector3.new( half.X, -half.Y, -half.Z),
+            cf * Vector3.new(-half.X, -half.Y, -half.Z),
+        }
+
+        local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+        local allOnScreen = true
+
+        for _, corner in ipairs(corners) do
+            local sp, onScreen, depth = worldToScreen(corner)
+            if not onScreen or depth < 0 then
+                allOnScreen = false
+                break
+            end
+            minX = math.min(minX, sp.X)
+            minY = math.min(minY, sp.Y)
+            maxX = math.max(maxX, sp.X)
+            maxY = math.max(maxY, sp.Y)
+        end
+
+        if not allOnScreen then
+            for _, drw in pairs(d) do
+                pcall(function() drw.Visible = false end)
+            end
+            continue
+        end
+
+        local isJammed = drone:GetAttribute("CommsLoss") == true
+        local droneTeam = drone:GetAttribute("TRV_Team")
+        local operatorId = drone:GetAttribute("OperatorUserId")
+        local isFriendly = false
+        local pilotPlayer = nil
+
+        if operatorId then
+            pilotPlayer = resolvePlayerByUserId(operatorId)
+            if pilotPlayer and not isEnemyPlayer(pilotPlayer) then
+                isFriendly = true
+            end
+        elseif droneTeam then
+            local teamObj = Teams:FindFirstChild(droneTeam)
+            if teamObj and not isEnemyTeam(teamObj) then
+                isFriendly = true
+            end
+        end
+
+        local boxColor
+        if isCrashed then
+            boxColor = CONFIG.DroneESP.CrashedColor
+        elseif isJammed then
+            boxColor = CONFIG.DroneESP.JammedColor
+        elseif isFriendly then
+            boxColor = CONFIG.DroneESP.FriendlyColor
+        else
+            boxColor = CONFIG.DroneESP.BoxColor
+        end
+
+        local pad = math.max(4, (maxX - minX) * 0.08)
+        minX = minX - pad; minY = minY - pad; maxX = maxX + pad; maxY = maxY + pad
+        local w = maxX - minX
+        local h = maxY - minY
+        local cx = minX + w * 0.5
+
+        -- Box
+        d.box.Size = Vector2.new(w, h)
+        d.box.Position = Vector2.new(minX, minY)
+        d.box.Color = boxColor
+        d.box.Visible = true
+
+        d.boxFill.Size = Vector2.new(w, h)
+        d.boxFill.Position = Vector2.new(minX, minY)
+        d.boxFill.Color = boxColor
+        d.boxFill.Visible = true
+
+        -- Name & Type Tag
+        local topY = minY - 4
+        if CONFIG.DroneESP.ShowName then
+            local droneType = drone:GetAttribute("droneType") or "UAV"
+            local labelPrefix = isCrashed and "[WRECK]" or ("[" .. string.upper(droneType) .. "]")
+            d.nameTag.Text = string.format("%s %s", labelPrefix, drone.Name)
+            d.nameTag.Position = Vector2.new(cx, topY - 16)
+            d.nameTag.Color = boxColor
+            d.nameTag.Visible = true
+            topY = topY - 16
+        else
+            d.nameTag.Visible = false
+        end
+
+        -- Pilot Tag
+        if CONFIG.DroneESP.ShowPilot and operatorId and not isCrashed then
+            local pilotName = pilotPlayer and pilotPlayer.DisplayName or ("ID:" .. tostring(operatorId))
+            d.pilotTag.Text = "Pilot: " .. pilotName
+            d.pilotTag.Position = Vector2.new(cx, topY - 14)
+            d.pilotTag.Visible = true
+        else
+            d.pilotTag.Visible = false
+        end
+
+        -- Bottom Info
+        local botY = maxY + 3
+        if CONFIG.DroneESP.ShowDistance then
+            d.distTag.Text = string.format("%.0f st", dist)
+            d.distTag.Position = Vector2.new(cx, botY)
+            d.distTag.Visible = true
+            botY = botY + 14
+        else
+            d.distTag.Visible = false
+        end
+
+        if CONFIG.DroneESP.ShowVelocity and state and not isCrashed then
+            local spd = math.floor(state.smoothVel.Magnitude + 0.5)
+            d.velTag.Text = string.format("%d st/s", spd)
+            d.velTag.Position = Vector2.new(cx, botY)
+            d.velTag.Visible = true
+        else
+            d.velTag.Visible = false
+        end
+
+        -- Health Bar
+        local maxHp = drone:GetAttribute("MaxHP") or 100
+        if CONFIG.DroneESP.ShowHealth and hp and maxHp > 0 and not isCrashed then
+            local ratio = math.clamp(hp / maxHp, 0, 1)
+            local barX = minX - 6
+            d.healthBarBG.From = Vector2.new(barX, minY)
+            d.healthBarBG.To = Vector2.new(barX, maxY)
+            d.healthBarBG.Visible = true
+
+            d.healthBar.From = Vector2.new(barX, maxY - (h * ratio))
+            d.healthBar.To = Vector2.new(barX, maxY)
+            d.healthBar.Color = Color3.fromRGB(
+                math.floor(255 * (1 - ratio)),
+                math.floor(255 * ratio),
+                40
+            )
+            d.healthBar.Visible = true
+        else
+            d.healthBar.Visible = false
+            d.healthBarBG.Visible = false
+        end
+
+        -- Tracer
+        if CONFIG.DroneESP.ShowTracer then
+            d.tracer.From = getTracerOrigin(CONFIG.DroneESP.TracerOrigin)
+            d.tracer.To = Vector2.new(cx, maxY)
+            d.tracer.Color = boxColor
+            d.tracer.Visible = true
+        else
+            d.tracer.Visible = false
+        end
+
+        -- Ballistic Lead Prediction Visualizer
+        if CONFIG.AimPrediction.Enabled and CONFIG.AimPrediction.ShowPrediction and not isFriendly and not isCrashed then
+            local shooterPos = camPos
+            local char = LocalPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                shooterPos = char.HumanoidRootPart.Position
+            end
+
+            local predPos, predTime = solveLeadIntercept(shooterPos, state, currentBulletSpeed, currentBulletDrop, currentBulletDrag)
+            if predPos and predTime then
+                local predScreen, predOn = worldToScreen(predPos)
+                local isLocked = aimLocked and (aimTarget == drone)
+
+                if predOn then
+                    local color = isLocked and CONFIG.AimPrediction.LockedColor or CONFIG.AimPrediction.PredictionColor
+                    d.predCircle.Position = predScreen
+                    d.predCircle.Color = color
+                    d.predCircle.Radius = math.clamp(900 / dist, 5, 22)
+                    d.predCircle.Visible = true
+
+                    d.predDot.Position = predScreen
+                    d.predDot.Color = color
+                    d.predDot.Visible = true
+
+                    d.predLine.From = Vector2.new(cx, minY + h * 0.5)
+                    d.predLine.To = predScreen
+                    d.predLine.Color = color
+                    d.predLine.Visible = true
                 else
                     d.predCircle.Visible = false
                     d.predDot.Visible = false
                     d.predLine.Visible = false
                 end
+            else
+                d.predCircle.Visible = false
+                d.predDot.Visible = false
+                d.predLine.Visible = false
             end
+        else
+            d.predCircle.Visible = false
+            d.predDot.Visible = false
+            d.predLine.Visible = false
         end
     end
-    
-    -- Cleanup removed drones
-    for model, drawings in pairs(droneDrawings) do
-        if not activeDrones[model] then
+
+    for drone, drawings in pairs(droneDrawings) do
+        if not activeDrones[drone] then
             destroyDrawings(drawings)
-            droneDrawings[model] = nil
-            droneVelocities[model] = nil
+            droneDrawings[drone] = nil
+            droneTrackers[drone] = nil
         end
     end
 end
 
--- ═══════════════════════════════════════════════════════════
--- PLAYER / DRG TEAM ESP
--- ═══════════════════════════════════════════════════════════
-local function updatePlayerESP()
-    if not CONFIG.TeamESP.Enabled then
-        for player, drawings in pairs(playerDrawings) do
+-- ═══════════════════════════════════════════════════════════════════════
+-- PLAYER ESP RENDER PASS
+-- ═══════════════════════════════════════════════════════════════════════
+local function updatePlayerESP(camPos)
+    if not CONFIG.PlayerESP.Enabled then
+        for _, drawings in pairs(playerDrawings) do
             for _, d in pairs(drawings) do
                 pcall(function() d.Visible = false end)
             end
         end
         for player, hl in pairs(playerHighlights) do
             pcall(function() hl:Destroy() end)
+            playerHighlights[player] = nil
         end
-        playerHighlights = {}
         return
     end
-    
+
     local activePlayers = {}
-    
+
     for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Team and isDRGSide(player.Team) then
-            activePlayers[player] = true
-            local char = player.Character
-            if not char then continue end
-            
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            local head = char:FindFirstChild("Head")
-            if not hrp or not hum or hum.Health <= 0 then continue end
-            
-            local dist = distanceTo(hrp.Position)
-            if dist > CONFIG.TeamESP.MaxDistance then
-                if playerDrawings[player] then
-                    for _, d in pairs(playerDrawings[player]) do
-                        pcall(function() d.Visible = false end)
-                    end
+        if player == LocalPlayer then continue end
+
+        local isEnemy = isEnemyPlayer(player)
+        if CONFIG.PlayerESP.EnemiesOnly and not isEnemy then
+            if playerDrawings[player] then
+                for _, d in pairs(playerDrawings[player]) do
+                    pcall(function() d.Visible = false end)
                 end
-                if playerHighlights[player] then
-                    pcall(function() playerHighlights[player]:Destroy() end)
-                    playerHighlights[player] = nil
+            end
+            if playerHighlights[player] then
+                pcall(function() playerHighlights[player]:Destroy() end)
+                playerHighlights[player] = nil
+            end
+            continue
+        end
+
+        local char = player.Character
+        if not char then continue end
+
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then continue end
+
+        local hrpPos = hrp.Position
+        local distSq = getDistanceSq(camPos, hrpPos)
+        if distSq > CONFIG.PlayerESP.MaxDistSq then
+            if playerDrawings[player] then
+                for _, d in pairs(playerDrawings[player]) do
+                    pcall(function() d.Visible = false end)
                 end
-                continue
             end
-            
-            -- Create drawings
-            if not playerDrawings[player] then
-                playerDrawings[player] = createPlayerDrawing()
+            if playerHighlights[player] then
+                pcall(function() playerHighlights[player]:Destroy() end)
+                playerHighlights[player] = nil
             end
-            
-            local d = playerDrawings[player]
-            
-            -- 3D bounding box from character
-            local rootCF = hrp.CFrame
-            local charSize = Vector3.new(4, 6, 3)  -- approximate player bounds
-            
-            local topPos = rootCF.Position + Vector3.new(0, charSize.Y / 2 + 0.5, 0)
-            local bottomPos = rootCF.Position - Vector3.new(0, charSize.Y / 2, 0)
-            
-            local topScreen, topOn = worldToScreen(topPos)
-            local botScreen, botOn = worldToScreen(bottomPos)
-            
-            if not topOn or not botOn then
-                for _, drawing in pairs(d) do
-                    pcall(function() drawing.Visible = false end)
-                end
-                continue
+            continue
+        end
+
+        activePlayers[player] = true
+        if not playerDrawings[player] then
+            playerDrawings[player] = createPlayerDrawing()
+        end
+
+        local d = playerDrawings[player]
+        local rootCF = hrp.CFrame
+        local charHeight = 5.5
+
+        local topPos = rootCF.Position + Vector3.new(0, charHeight * 0.5 + 0.6, 0)
+        local botPos = rootCF.Position - Vector3.new(0, charHeight * 0.5, 0)
+
+        local topScreen, topOn = worldToScreen(topPos)
+        local botScreen, botOn = worldToScreen(botPos)
+
+        if not topOn or not botOn then
+            for _, drw in pairs(d) do
+                pcall(function() drw.Visible = false end)
             end
-            
-            local h = math.abs(botScreen.Y - topScreen.Y)
-            local w = h * 0.55
-            local cx = (topScreen.X + botScreen.X) / 2
-            
-            -- Box
-            d.box.Size = Vector2.new(w, h)
-            d.box.Position = Vector2.new(cx - w/2, topScreen.Y)
-            d.box.Color = CONFIG.TeamESP.BoxColor
-            d.box.Visible = true
-            
-            d.boxFill.Size = Vector2.new(w, h)
-            d.boxFill.Position = Vector2.new(cx - w/2, topScreen.Y)
-            d.boxFill.Color = CONFIG.TeamESP.BoxColor
-            d.boxFill.Visible = true
-            
-            -- Name
-            if CONFIG.TeamESP.ShowName then
-                local teamTag = player.Team and player.Team.Name or ""
-                d.nameTag.Text = string.format("[%s] %s", teamTag, player.DisplayName)
-                d.nameTag.Position = Vector2.new(cx, topScreen.Y - 16)
-                d.nameTag.Color = CONFIG.TeamESP.NameColor
-                d.nameTag.Visible = true
-            else
-                d.nameTag.Visible = false
-            end
-            
-            -- Distance
-            if CONFIG.TeamESP.ShowDistance then
-                d.distTag.Text = string.format("%.0f st", dist)
-                d.distTag.Position = Vector2.new(cx, botScreen.Y + 3)
-                d.distTag.Visible = true
-            else
-                d.distTag.Visible = false
-            end
-            
-            -- Weapon
-            if CONFIG.TeamESP.ShowWeapon then
-                local tool = char:FindFirstChildOfClass("Tool")
-                if tool then
-                    d.weaponTag.Text = tool.Name
-                    d.weaponTag.Position = Vector2.new(cx, botScreen.Y + 17)
-                    d.weaponTag.Visible = true
-                else
-                    d.weaponTag.Visible = false
-                end
+            continue
+        end
+
+        local h = math.abs(botScreen.Y - topScreen.Y)
+        local w = h * 0.55
+        local cx = (topScreen.X + botScreen.X) * 0.5
+        local minX = cx - w * 0.5
+        local minY = topScreen.Y
+        local maxY = botScreen.Y
+
+        local color = isEnemy and CONFIG.PlayerESP.BoxColor or CONFIG.PlayerESP.FriendlyColor
+
+        d.box.Size = Vector2.new(w, h)
+        d.box.Position = Vector2.new(minX, minY)
+        d.box.Color = color
+        d.box.Visible = true
+
+        d.boxFill.Size = Vector2.new(w, h)
+        d.boxFill.Position = Vector2.new(minX, minY)
+        d.boxFill.Color = color
+        d.boxFill.Visible = true
+
+        if CONFIG.PlayerESP.ShowName then
+            local teamName = player.Team and player.Team.Name or "No Team"
+            d.nameTag.Text = string.format("[%s] %s", teamName, player.DisplayName)
+            d.nameTag.Position = Vector2.new(cx, minY - 16)
+            d.nameTag.Color = isEnemy and CONFIG.PlayerESP.NameColor or Color3.fromRGB(150, 220, 255)
+            d.nameTag.Visible = true
+        else
+            d.nameTag.Visible = false
+        end
+
+        local botY = maxY + 3
+        if CONFIG.PlayerESP.ShowDistance then
+            d.distTag.Text = string.format("%.0f st", math.sqrt(distSq))
+            d.distTag.Position = Vector2.new(cx, botY)
+            d.distTag.Visible = true
+            botY = botY + 14
+        else
+            d.distTag.Visible = false
+        end
+
+        if CONFIG.PlayerESP.ShowWeapon then
+            local tool = char:FindFirstChildOfClass("Tool")
+            if tool then
+                d.weaponTag.Text = tool.Name
+                d.weaponTag.Position = Vector2.new(cx, botY)
+                d.weaponTag.Visible = true
             else
                 d.weaponTag.Visible = false
             end
-            
-            -- Health bar (left side)
-            if CONFIG.TeamESP.ShowHealth then
-                local ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
-                local barX = cx - w/2 - 5
-                d.healthBarBG.From = Vector2.new(barX, topScreen.Y)
-                d.healthBarBG.To = Vector2.new(barX, botScreen.Y)
-                d.healthBarBG.Visible = true
-                d.healthBar.From = Vector2.new(barX, botScreen.Y - h * ratio)
-                d.healthBar.To = Vector2.new(barX, botScreen.Y)
-                d.healthBar.Color = Color3.fromRGB(
-                    math.floor(255 * (1 - ratio)),
-                    math.floor(255 * ratio),
-                    50
-                )
-                d.healthBar.Visible = true
-            else
-                d.healthBar.Visible = false
-                d.healthBarBG.Visible = false
-            end
-            
-            -- Tracer
-            if CONFIG.TeamESP.ShowTracer then
-                d.tracer.From = getScreenBottom()
-                d.tracer.To = Vector2.new(cx, botScreen.Y)
-                d.tracer.Color = CONFIG.TeamESP.BoxColor
-                d.tracer.Visible = true
-            else
-                d.tracer.Visible = false
-            end
-            
-            -- 3D Highlight
-            if not playerHighlights[player] then
-                local hl = Instance.new("Highlight")
-                hl.Name = "SKYFIRE_ESP"
-                hl.FillTransparency = CONFIG.TeamESP.HighlightFill
-                hl.OutlineColor = CONFIG.TeamESP.HighlightOutline
-                hl.FillColor = CONFIG.TeamESP.BoxColor
-                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                hl.Adornee = char
-                hl.Parent = char
-                playerHighlights[player] = hl
-            end
+        else
+            d.weaponTag.Visible = false
+        end
+
+        if CONFIG.PlayerESP.ShowHealth then
+            local ratio = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+            local barX = minX - 6
+            d.healthBarBG.From = Vector2.new(barX, minY)
+            d.healthBarBG.To = Vector2.new(barX, maxY)
+            d.healthBarBG.Visible = true
+
+            d.healthBar.From = Vector2.new(barX, maxY - (h * ratio))
+            d.healthBar.To = Vector2.new(barX, maxY)
+            d.healthBar.Color = Color3.fromRGB(
+                math.floor(255 * (1 - ratio)),
+                math.floor(255 * ratio),
+                40
+            )
+            d.healthBar.Visible = true
+        else
+            d.healthBar.Visible = false
+            d.healthBarBG.Visible = false
+        end
+
+        if CONFIG.PlayerESP.ShowTracer then
+            d.tracer.From = getTracerOrigin("Bottom")
+            d.tracer.To = Vector2.new(cx, maxY)
+            d.tracer.Color = color
+            d.tracer.Visible = true
+        else
+            d.tracer.Visible = false
+        end
+
+        if not playerHighlights[player] then
+            local hl = Instance.new("Highlight")
+            hl.Name = "SKYFIRE_ESP_HL"
+            hl.FillTransparency = CONFIG.PlayerESP.HighlightFill
+            hl.OutlineColor = color
+            hl.FillColor = color
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Adornee = char
+            hl.Parent = char
+            playerHighlights[player] = hl
+        else
+            playerHighlights[player].OutlineColor = color
+            playerHighlights[player].FillColor = color
         end
     end
-    
-    -- Cleanup removed players
+
     for player, drawings in pairs(playerDrawings) do
         if not activePlayers[player] then
             destroyDrawings(drawings)
@@ -907,358 +1092,84 @@ local function updatePlayerESP()
     end
 end
 
--- ═══════════════════════════════════════════════════════════
--- MODERN GLASSMORPHISM GUI
--- ═══════════════════════════════════════════════════════════
-local gui
+-- ═══════════════════════════════════════════════════════════════════════
+-- AIM ASSIST: UNIVERSAL DISPATCHER (TURRET SCOPE & INFANTRY)
+-- ═══════════════════════════════════════════════════════════════════════
+local function updateAimAssist()
+    -- Sync FOV Circle
+    if CONFIG.AimPrediction.ShowFOVCircle and CONFIG.AimPrediction.AimAssist then
+        local mousePos = UserInputService:GetMouseLocation()
+        fovCircle.Position = mousePos
+        fovCircle.Radius = CONFIG.AimPrediction.AimAssistFOV
+        fovCircle.Visible = true
+    else
+        fovCircle.Visible = false
+    end
 
-local function createGUI()
-    -- Cleanup existing
-    local existing = LocalPlayer.PlayerGui:FindFirstChild("SkyfireEnhancedGUI")
-    if existing then existing:Destroy() end
-    
-    gui = Instance.new("ScreenGui")
-    gui.Name = "SkyfireEnhancedGUI"
-    gui.ResetOnSpawn = false
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = 999
-    gui.Parent = LocalPlayer.PlayerGui
-    
-    -- Main container
-    local mainFrame = Instance.new("Frame")
-    mainFrame.Name = "MainFrame"
-    mainFrame.AnchorPoint = Vector2.new(0, 0.5)
-    mainFrame.Position = UDim2.new(0, 14, 0.5, 0)
-    mainFrame.Size = UDim2.new(0, 280, 0, 0)  -- auto-sized by UIListLayout
-    mainFrame.AutomaticSize = Enum.AutomaticSize.Y
-    mainFrame.BackgroundColor3 = CONFIG.GUI.DarkBG
-    mainFrame.BackgroundTransparency = 0.08
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Parent = gui
-    
-    local mainCorner = Instance.new("UICorner")
-    mainCorner.CornerRadius = UDim.new(0, 14)
-    mainCorner.Parent = mainFrame
-    
-    local mainStroke = Instance.new("UIStroke")
-    mainStroke.Color = CONFIG.GUI.AccentColor
-    mainStroke.Transparency = 0.5
-    mainStroke.Thickness = 1.5
-    mainStroke.Parent = mainFrame
-    
-    local mainPadding = Instance.new("UIPadding")
-    mainPadding.PaddingTop = UDim.new(0, 10)
-    mainPadding.PaddingBottom = UDim.new(0, 10)
-    mainPadding.PaddingLeft = UDim.new(0, 12)
-    mainPadding.PaddingRight = UDim.new(0, 12)
-    mainPadding.Parent = mainFrame
-    
-    local listLayout = Instance.new("UIListLayout")
-    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    listLayout.Padding = UDim.new(0, 6)
-    listLayout.Parent = mainFrame
-    
-    -- ═══ TITLE BAR ═══
-    local titleBar = Instance.new("Frame")
-    titleBar.Name = "TitleBar"
-    titleBar.Size = UDim2.new(1, 0, 0, 36)
-    titleBar.BackgroundTransparency = 1
-    titleBar.LayoutOrder = 0
-    titleBar.Parent = mainFrame
-    
-    local titleIcon = Instance.new("TextLabel")
-    titleIcon.Size = UDim2.new(0, 28, 0, 28)
-    titleIcon.Position = UDim2.new(0, 0, 0.5, -14)
-    titleIcon.BackgroundColor3 = CONFIG.GUI.AccentColor
-    titleIcon.BackgroundTransparency = 0.15
-    titleIcon.Text = "⚡"
-    titleIcon.TextSize = 16
-    titleIcon.Font = Enum.Font.GothamBold
-    titleIcon.TextColor3 = Color3.new(1, 1, 1)
-    titleIcon.Parent = titleBar
-    
-    local iconCorner = Instance.new("UICorner")
-    iconCorner.CornerRadius = UDim.new(0, 7)
-    iconCorner.Parent = titleIcon
-    
-    local titleText = Instance.new("TextLabel")
-    titleText.Size = UDim2.new(1, -36, 0, 20)
-    titleText.Position = UDim2.new(0, 36, 0, 2)
-    titleText.BackgroundTransparency = 1
-    titleText.Text = "SKYFIRE ENHANCED"
-    titleText.TextXAlignment = Enum.TextXAlignment.Left
-    titleText.TextSize = 15
-    titleText.Font = Enum.Font.GothamBold
-    titleText.TextColor3 = CONFIG.GUI.AccentColor
-    titleText.Parent = titleBar
-    
-    local titleSub = Instance.new("TextLabel")
-    titleSub.Size = UDim2.new(1, -36, 0, 14)
-    titleSub.Position = UDim2.new(0, 36, 0, 21)
-    titleSub.BackgroundTransparency = 1
-    titleSub.Text = "v2.0 · Drone ESP · DRG ESP · Aimbot"
-    titleSub.TextXAlignment = Enum.TextXAlignment.Left
-    titleSub.TextSize = 10
-    titleSub.Font = Enum.Font.Gotham
-    titleSub.TextColor3 = CONFIG.GUI.DimText
-    titleSub.Parent = titleBar
-    
-    -- ═══ DIVIDER ═══
-    local function createDivider(order)
-        local divider = Instance.new("Frame")
-        divider.Size = UDim2.new(1, 0, 0, 1)
-        divider.BackgroundColor3 = CONFIG.GUI.AccentColor
-        divider.BackgroundTransparency = 0.7
-        divider.BorderSizePixel = 0
-        divider.LayoutOrder = order
-        divider.Parent = mainFrame
-        return divider
-    end
-    
-    -- ═══ TOGGLE BUTTON CREATOR ═══
-    local function createToggle(name, description, order, getter, setter)
-        local toggleFrame = Instance.new("Frame")
-        toggleFrame.Name = name
-        toggleFrame.Size = UDim2.new(1, 0, 0, 32)
-        toggleFrame.BackgroundColor3 = CONFIG.GUI.CardBG
-        toggleFrame.BackgroundTransparency = 0.4
-        toggleFrame.BorderSizePixel = 0
-        toggleFrame.LayoutOrder = order
-        toggleFrame.Parent = mainFrame
-        
-        local toggleCorner = Instance.new("UICorner")
-        toggleCorner.CornerRadius = UDim.new(0, 8)
-        toggleCorner.Parent = toggleFrame
-        
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1, -56, 1, 0)
-        label.Position = UDim2.new(0, 10, 0, 0)
-        label.BackgroundTransparency = 1
-        label.Text = description
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.TextSize = 12
-        label.Font = Enum.Font.GothamMedium
-        label.TextColor3 = CONFIG.GUI.TextColor
-        label.Parent = toggleFrame
-        
-        -- Toggle switch
-        local switchBG = Instance.new("Frame")
-        switchBG.Name = "SwitchBG"
-        switchBG.AnchorPoint = Vector2.new(1, 0.5)
-        switchBG.Position = UDim2.new(1, -8, 0.5, 0)
-        switchBG.Size = UDim2.new(0, 38, 0, 20)
-        switchBG.BackgroundColor3 = getter() and CONFIG.GUI.AccentColor or Color3.fromRGB(60, 60, 70)
-        switchBG.BorderSizePixel = 0
-        switchBG.Parent = toggleFrame
-        
-        local switchCorner = Instance.new("UICorner")
-        switchCorner.CornerRadius = UDim.new(0.5, 0)
-        switchCorner.Parent = switchBG
-        
-        local knob = Instance.new("Frame")
-        knob.Name = "Knob"
-        knob.AnchorPoint = Vector2.new(0, 0.5)
-        knob.Position = getter() and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
-        knob.Size = UDim2.new(0, 16, 0, 16)
-        knob.BackgroundColor3 = Color3.new(1, 1, 1)
-        knob.BorderSizePixel = 0
-        knob.Parent = switchBG
-        
-        local knobCorner = Instance.new("UICorner")
-        knobCorner.CornerRadius = UDim.new(0.5, 0)
-        knobCorner.Parent = knob
-        
-        -- Click handler
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 1, 0)
-        btn.BackgroundTransparency = 1
-        btn.Text = ""
-        btn.Parent = toggleFrame
-        
-        btn.MouseButton1Click:Connect(function()
-            local newState = not getter()
-            setter(newState)
-            
-            -- Animate
-            local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-            TweenService:Create(switchBG, tweenInfo, {
-                BackgroundColor3 = newState and CONFIG.GUI.AccentColor or Color3.fromRGB(60, 60, 70)
-            }):Play()
-            TweenService:Create(knob, tweenInfo, {
-                Position = newState and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
-            }):Play()
-        end)
-        
-        return toggleFrame
-    end
-    
-    -- ═══ SECTION HEADER ═══
-    local function createSectionHeader(text, order, icon)
-        local header = Instance.new("TextLabel")
-        header.Size = UDim2.new(1, 0, 0, 22)
-        header.BackgroundTransparency = 1
-        header.Text = (icon or "").. "  " .. text
-        header.TextXAlignment = Enum.TextXAlignment.Left
-        header.TextSize = 12
-        header.Font = Enum.Font.GothamBold
-        header.TextColor3 = CONFIG.GUI.AccentAlt
-        header.LayoutOrder = order
-        header.Parent = mainFrame
-        return header
-    end
-    
-    -- ═══ BUILD SECTIONS ═══
-    createDivider(1)
-    
-    -- DRONE ESP section
-    createSectionHeader("DRONE ESP", 10, "🛸")
-    createToggle("DroneESPToggle", "Drone ESP", 11,
-        function() return CONFIG.DroneESP.Enabled end,
-        function(v) CONFIG.DroneESP.Enabled = v end
-    )
-    createToggle("DroneBoxToggle", "Show Tracers", 12,
-        function() return CONFIG.DroneESP.ShowTracer end,
-        function(v) CONFIG.DroneESP.ShowTracer = v end
-    )
-    createToggle("DroneVelToggle", "Show Velocity", 13,
-        function() return CONFIG.DroneESP.ShowVelocity end,
-        function(v) CONFIG.DroneESP.ShowVelocity = v end
-    )
-    createToggle("DroneNameToggle", "Show Names", 14,
-        function() return CONFIG.DroneESP.ShowName end,
-        function(v) CONFIG.DroneESP.ShowName = v end
-    )
-    
-    createDivider(20)
-    
-    -- AIM PREDICTION section
-    createSectionHeader("AIM PREDICTION", 21, "🎯")
-    createToggle("AimPredToggle", "Aim Prediction", 22,
-        function() return CONFIG.AimPrediction.Enabled end,
-        function(v) CONFIG.AimPrediction.Enabled = v end
-    )
-    createToggle("AimShowToggle", "Show Predicted Point", 23,
-        function() return CONFIG.AimPrediction.ShowPrediction end,
-        function(v) CONFIG.AimPrediction.ShowPrediction = v end
-    )
-    createToggle("AimAssistToggle", "Aim Assist (E key)", 24,
-        function() return CONFIG.AimPrediction.AimAssist end,
-        function(v) CONFIG.AimPrediction.AimAssist = v end
-    )
-    
-    createDivider(30)
-    
-    -- DRG TEAM ESP section
-    createSectionHeader("DRG / ENEMY ESP", 31, "👥")
-    createToggle("TeamESPToggle", "Team ESP", 32,
-        function() return CONFIG.TeamESP.Enabled end,
-        function(v) CONFIG.TeamESP.Enabled = v end
-    )
-    createToggle("TeamNameToggle", "Show Names", 33,
-        function() return CONFIG.TeamESP.ShowName end,
-        function(v) CONFIG.TeamESP.ShowName = v end
-    )
-    createToggle("TeamHealthToggle", "Show Health Bars", 34,
-        function() return CONFIG.TeamESP.ShowHealth end,
-        function(v) CONFIG.TeamESP.ShowHealth = v end
-    )
-    createToggle("TeamWeaponToggle", "Show Weapons", 35,
-        function() return CONFIG.TeamESP.ShowWeapon end,
-        function(v) CONFIG.TeamESP.ShowWeapon = v end
-    )
-    createToggle("TeamTracerToggle", "Show Tracers", 36,
-        function() return CONFIG.TeamESP.ShowTracer end,
-        function(v) CONFIG.TeamESP.ShowTracer = v end
-    )
-    
-    createDivider(40)
-    
-    -- Status footer
-    local footer = Instance.new("TextLabel")
-    footer.Size = UDim2.new(1, 0, 0, 16)
-    footer.BackgroundTransparency = 1
-    footer.Text = "[RShift] Toggle GUI  ·  [E] Lock Aim"
-    footer.TextSize = 9
-    footer.Font = Enum.Font.Gotham
-    footer.TextColor3 = CONFIG.GUI.DimText
-    footer.LayoutOrder = 50
-    footer.Parent = mainFrame
-    
-    -- Make draggable
-    local dragging = false
-    local dragStart, startPos
-    
-    titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            dragStart = input.Position
-            startPos = mainFrame.Position
+    -- Continuous key state check: unblocks key when gameProcessed is swallowed by turret scope
+    if CONFIG.AimPrediction.AimAssist then
+        local keyHeld = UserInputService:IsKeyDown(CONFIG.AimPrediction.AimKey)
+        if keyHeld and not aimLocked then
+            local model, _ = findBestDroneTarget()
+            if model then
+                aimTarget = model
+                aimLocked = true
+            end
+        elseif not keyHeld and aimLocked then
+            aimLocked = false
+            aimTarget = nil
         end
-    end)
-    
-    titleBar.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
+    else
+        aimLocked = false
+        aimTarget = nil
+    end
+
+    if not aimLocked or not aimTarget then return end
+
+    local state = droneTrackers[aimTarget]
+    if not state or not aimTarget.Parent or aimTarget:GetAttribute("Crashed") or (aimTarget:GetAttribute("HP") and aimTarget:GetAttribute("HP") <= 0) then
+        aimLocked = false
+        aimTarget = nil
+        return
+    end
+
+    local shooterPos = Camera.CFrame.Position
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then
+        shooterPos = char.HumanoidRootPart.Position
+    end
+
+    local predPos, _ = solveLeadIntercept(shooterPos, state, currentBulletSpeed, currentBulletDrop, currentBulletDrag)
+    if predPos then
+        -- Check if seated in a turret (ZU-23-2)
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local isSeatedTurret = hum and hum.SeatPart ~= nil
+
+        -- If mousemoverel is supported by executor, use direct mouse delta (vital for Turret aim!)
+        local predScreen, onScreen = worldToScreen(predPos)
+        if onScreen and mousemoverel and isSeatedTurret then
+            local center = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
+            local deltaX = (predScreen.X - center.X) * CONFIG.AimPrediction.AimAssistSmooth
+            local deltaY = (predScreen.Y - center.Y) * CONFIG.AimPrediction.AimAssistSmooth
+            mousemoverel(deltaX, deltaY)
+        else
+            -- Direct camera smooth lerp for infantry and general aiming
+            local targetCF = CFrame.lookAt(Camera.CFrame.Position, predPos)
+            Camera.CFrame = Camera.CFrame:Lerp(targetCF, CONFIG.AimPrediction.AimAssistSmooth)
         end
-    end)
-    
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-            local delta = input.Position - dragStart
-            mainFrame.Position = UDim2.new(
-                startPos.X.Scale,
-                startPos.X.Offset + delta.X,
-                startPos.Y.Scale,
-                startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-    
-    -- Open animation
-    mainFrame.BackgroundTransparency = 1
-    TweenService:Create(mainFrame, TweenInfo.new(0.5, Enum.EasingStyle.Exponential), {
-        BackgroundTransparency = 0.08
-    }):Play()
-    
-    return gui
+    end
 end
 
--- ═══════════════════════════════════════════════════════════
--- INPUT HANDLING
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
+-- UNCONDITIONAL INPUT HANDLING (NO GAME-PROCESSED BLOCK)
+-- ═══════════════════════════════════════════════════════════════════════
 local function setupInput()
-    table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if gameProcessed then return end
-        
-        -- Toggle GUI
-        if input.KeyCode == CONFIG.GUI.ToggleKey then
-            if gui then
-                local mainFrame = gui:FindFirstChild("MainFrame")
-                if mainFrame then
-                    guiVisible = not guiVisible
-                    local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad)
-                    if guiVisible then
-                        mainFrame.Visible = true
-                        TweenService:Create(mainFrame, tweenInfo, {
-                            BackgroundTransparency = 0.08
-                        }):Play()
-                    else
-                        TweenService:Create(mainFrame, tweenInfo, {
-                            BackgroundTransparency = 1
-                        }):Play()
-                        task.delay(0.3, function()
-                            if not guiVisible then mainFrame.Visible = false end
-                        end)
-                    end
-                end
-            end
-        end
-        
-        -- Aim lock
+    table.insert(connections, UserInputService.InputBegan:Connect(function(input)
+        -- Process AimKey UNCONDITIONALLY (bypasses gameProcessed when scoped in ZU-23-2)
         if input.KeyCode == CONFIG.AimPrediction.AimKey then
             if CONFIG.AimPrediction.AimAssist then
-                local model, entry = findBestDroneTarget()
-                if model and entry then
+                local model, _ = findBestDroneTarget()
+                if model then
                     aimTarget = model
                     aimLocked = true
                 else
@@ -1268,8 +1179,8 @@ local function setupInput()
             end
         end
     end))
-    
-    table.insert(connections, UserInputService.InputEnded:Connect(function(input, gameProcessed)
+
+    table.insert(connections, UserInputService.InputEnded:Connect(function(input)
         if input.KeyCode == CONFIG.AimPrediction.AimKey then
             aimLocked = false
             aimTarget = nil
@@ -1277,101 +1188,379 @@ local function setupInput()
     end))
 end
 
--- ═══════════════════════════════════════════════════════════
--- AIM ASSIST — MOVE CAMERA TO PREDICTED POS
--- ═══════════════════════════════════════════════════════════
-local function updateAimAssist()
-    if not CONFIG.AimPrediction.AimAssist or not aimLocked or not aimTarget then return end
-    
-    local entry = droneVelocities[aimTarget]
-    if not entry or not aimTarget.Parent or aimTarget:GetAttribute("Crashed") then
-        aimLocked = false
-        aimTarget = nil
-        return
+-- ═══════════════════════════════════════════════════════════════════════
+-- ZERO-LAG ASYNCHRONOUS RAYFIELD UI INITIALIZATION
+-- ═══════════════════════════════════════════════════════════════════════
+local RayfieldInstance = nil
+local telemetryParagraph = nil
+
+local function loadRayfieldLibrary()
+    if getgenv and getgenv().Rayfield then
+        return getgenv().Rayfield
     end
-    
-    local shooterPos = Camera.CFrame.Position
-    local char = LocalPlayer.Character
-    if char then
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        if hrp then shooterPos = hrp.Position end
+
+    local success, lib = pcall(function()
+        return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+    end)
+    if success and lib then return lib end
+
+    local success2, lib2 = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/shlexware/Rayfield/main/source.lua"))()
+    end)
+    if success2 and lib2 then return lib2 end
+
+    if readfile then
+        local success3, lib3 = pcall(function()
+            return loadstring(readfile("Rayfield-main/source.lua"))()
+        end)
+        if success3 and lib3 then return lib3 end
     end
-    
-    local predPos, predTime = solveIntercept(shooterPos, entry, CONFIG.AimPrediction.BulletSpeed)
-    if predPos then
-        -- Smoothly move camera to look at predicted position
-        local targetCF = CFrame.lookAt(Camera.CFrame.Position, predPos)
-        Camera.CFrame = Camera.CFrame:Lerp(targetCF, 0.15)
-    end
+
+    return nil
 end
 
--- ═══════════════════════════════════════════════════════════
--- MASTER RENDER LOOP
--- ═══════════════════════════════════════════════════════════
+local function initRayfieldUIAsync()
+    task.defer(function()
+        local Rayfield = loadRayfieldLibrary()
+        if not Rayfield then
+            warn("[SKYFIRE ENHANCED] Rayfield UI skipped (headless mode active).")
+            return
+        end
+
+        RayfieldInstance = Rayfield
+
+        local Window = Rayfield:CreateWindow({
+            Name = "SKYFIRE ENHANCED v3.6",
+            Icon = 0,
+            LoadingTitle = "SKYFIRE ENHANCED",
+            LoadingSubtitle = "by Qusa  ·  Combat Suite",
+            Theme = "Default",
+
+            DisableRayfieldPrompts = true,
+            DisableBuildWarnings = true,
+
+            ConfigurationSaving = {
+                Enabled = false,
+                FolderName = nil,
+                FileName = "SkyfireSettings"
+            },
+
+            KeySystem = false, -- NO KEY SYSTEM
+        })
+
+        -- ═══ TAB 1: DRONE ESP ═══
+        local DroneTab = Window:CreateTab("🛸 Drone ESP", 4483362458)
+        DroneTab:CreateSection("ESP Visibility & Filters")
+
+        DroneTab:CreateToggle({
+            Name = "Enable Drone ESP",
+            CurrentValue = CONFIG.DroneESP.Enabled,
+            Flag = "DroneESP_Enabled",
+            Callback = function(Value) CONFIG.DroneESP.Enabled = Value end,
+        })
+
+        DroneTab:CreateToggle({
+            Name = "Show Wrecks & Falling Drones",
+            CurrentValue = CONFIG.DroneESP.ShowCrashed,
+            Flag = "DroneESP_ShowWrecks",
+            Callback = function(Value) CONFIG.DroneESP.ShowCrashed = Value end,
+        })
+
+        DroneTab:CreateSlider({
+            Name = "Drone Max Distance",
+            Range = {500, 15000},
+            Increment = 100,
+            Suffix = " studs",
+            CurrentValue = CONFIG.DroneESP.MaxDistance,
+            Flag = "DroneESP_MaxDist",
+            Callback = function(Value)
+                CONFIG.DroneESP.MaxDistance = Value
+                CONFIG.DroneESP.MaxDistSq = Value * Value
+            end,
+        })
+
+        DroneTab:CreateSection("Drone Visuals")
+
+        DroneTab:CreateToggle({
+            Name = "Show Tracers",
+            CurrentValue = CONFIG.DroneESP.ShowTracer,
+            Flag = "DroneESP_Tracers",
+            Callback = function(Value) CONFIG.DroneESP.ShowTracer = Value end,
+        })
+
+        DroneTab:CreateDropdown({
+            Name = "Tracer Origin",
+            Options = {"Bottom", "Center", "Mouse"},
+            CurrentOption = {"Bottom"},
+            MultipleOptions = false,
+            Flag = "DroneESP_TracerOrigin",
+            Callback = function(Option)
+                local sel = type(Option) == "table" and Option[1] or Option
+                CONFIG.DroneESP.TracerOrigin = sel
+            end,
+        })
+
+        DroneTab:CreateToggle({
+            Name = "Show Pilot Username",
+            CurrentValue = CONFIG.DroneESP.ShowPilot,
+            Flag = "DroneESP_ShowPilot",
+            Callback = function(Value) CONFIG.DroneESP.ShowPilot = Value end,
+        })
+
+        DroneTab:CreateToggle({
+            Name = "Show Kinematic Velocity",
+            CurrentValue = CONFIG.DroneESP.ShowVelocity,
+            Flag = "DroneESP_ShowVelocity",
+            Callback = function(Value) CONFIG.DroneESP.ShowVelocity = Value end,
+        })
+
+        DroneTab:CreateToggle({
+            Name = "Show Health Bars",
+            CurrentValue = CONFIG.DroneESP.ShowHealth,
+            Flag = "DroneESP_ShowHealth",
+            Callback = function(Value) CONFIG.DroneESP.ShowHealth = Value end,
+        })
+
+        -- ═══ TAB 2: AIMBOT & BALLISTICS ═══
+        local AimTab = Window:CreateTab("🎯 Aimbot & Lead", 4483362458)
+        AimTab:CreateSection("Ballistics Lead Calculation")
+
+        AimTab:CreateToggle({
+            Name = "Enable Aim Prediction",
+            CurrentValue = CONFIG.AimPrediction.Enabled,
+            Flag = "Aim_Enabled",
+            Callback = function(Value) CONFIG.AimPrediction.Enabled = Value end,
+        })
+
+        AimTab:CreateToggle({
+            Name = "Show Predicted Lead Point",
+            CurrentValue = CONFIG.AimPrediction.ShowPrediction,
+            Flag = "Aim_ShowPoint",
+            Callback = function(Value) CONFIG.AimPrediction.ShowPrediction = Value end,
+        })
+
+        AimTab:CreateToggle({
+            Name = "Auto-Detect Weapon / Turret Ballistics",
+            CurrentValue = CONFIG.AimPrediction.AutoDetectWeapon,
+            Flag = "Aim_AutoDetect",
+            Callback = function(Value) CONFIG.AimPrediction.AutoDetectWeapon = Value end,
+        })
+
+        AimTab:CreateToggle({
+            Name = "Compensate Shooter Velocity",
+            CurrentValue = CONFIG.AimPrediction.CompensateShooter,
+            Flag = "Aim_CompShooter",
+            Callback = function(Value) CONFIG.AimPrediction.CompensateShooter = Value end,
+        })
+
+        AimTab:CreateSection("Aim Assist Lock & FOV")
+
+        AimTab:CreateToggle({
+            Name = "Enable Aim Assist Lock (Hold Key)",
+            CurrentValue = CONFIG.AimPrediction.AimAssist,
+            Flag = "Aim_Assist",
+            Callback = function(Value) CONFIG.AimPrediction.AimAssist = Value end,
+        })
+
+        AimTab:CreateToggle({
+            Name = "Show FOV Circle",
+            CurrentValue = CONFIG.AimPrediction.ShowFOVCircle,
+            Flag = "Aim_ShowFOV",
+            Callback = function(Value) CONFIG.AimPrediction.ShowFOVCircle = Value end,
+        })
+
+        AimTab:CreateSlider({
+            Name = "Aim Assist FOV Radius",
+            Range = {30, 500},
+            Increment = 5,
+            Suffix = " px",
+            CurrentValue = CONFIG.AimPrediction.AimAssistFOV,
+            Flag = "Aim_FOVRadius",
+            Callback = function(Value)
+                CONFIG.AimPrediction.AimAssistFOV = Value
+                fovCircle.Radius = Value
+            end,
+        })
+
+        AimTab:CreateSlider({
+            Name = "Aim Assist Smoothing",
+            Range = {0.05, 1.0},
+            Increment = 0.05,
+            Suffix = " lerp",
+            CurrentValue = CONFIG.AimPrediction.AimAssistSmooth,
+            Flag = "Aim_Smoothing",
+            Callback = function(Value) CONFIG.AimPrediction.AimAssistSmooth = Value end,
+        })
+
+        AimTab:CreateKeybind({
+            Name = "Aim Lock Key",
+            CurrentKeybind = "E",
+            HoldToInteract = false,
+            Flag = "Aim_Keybind",
+            Callback = function(Keybind)
+                local keyEnum = Enum.KeyCode[Keybind]
+                if keyEnum then
+                    CONFIG.AimPrediction.AimKey = keyEnum
+                end
+            end,
+        })
+
+        -- ═══ TAB 3: PLAYER ESP ═══
+        local PlayerTab = Window:CreateTab("👥 Soldier ESP", 4483362458)
+        PlayerTab:CreateSection("Soldier ESP Settings")
+
+        PlayerTab:CreateToggle({
+            Name = "Enable Soldier ESP",
+            CurrentValue = CONFIG.PlayerESP.Enabled,
+            Flag = "Player_Enabled",
+            Callback = function(Value) CONFIG.PlayerESP.Enabled = Value end,
+        })
+
+        PlayerTab:CreateToggle({
+            Name = "Enemy Side Only (Noobian vs Dummian)",
+            CurrentValue = CONFIG.PlayerESP.EnemiesOnly,
+            Flag = "Player_EnemiesOnly",
+            Callback = function(Value) CONFIG.PlayerESP.EnemiesOnly = Value end,
+        })
+
+        PlayerTab:CreateSlider({
+            Name = "Player Max Distance",
+            Range = {500, 8000},
+            Increment = 100,
+            Suffix = " studs",
+            CurrentValue = CONFIG.PlayerESP.MaxDistance,
+            Flag = "Player_MaxDist",
+            Callback = function(Value)
+                CONFIG.PlayerESP.MaxDistance = Value
+                CONFIG.PlayerESP.MaxDistSq = Value * Value
+            end,
+        })
+
+        PlayerTab:CreateToggle({
+            Name = "Show Held Weapon",
+            CurrentValue = CONFIG.PlayerESP.ShowWeapon,
+            Flag = "Player_ShowWeapon",
+            Callback = function(Value) CONFIG.PlayerESP.ShowWeapon = Value end,
+        })
+
+        PlayerTab:CreateToggle({
+            Name = "Show Health Bars",
+            CurrentValue = CONFIG.PlayerESP.ShowHealth,
+            Flag = "Player_ShowHealth",
+            Callback = function(Value) CONFIG.PlayerESP.ShowHealth = Value end,
+        })
+
+        PlayerTab:CreateToggle({
+            Name = "Show Tracers",
+            CurrentValue = CONFIG.PlayerESP.ShowTracer,
+            Flag = "Player_ShowTracer",
+            Callback = function(Value) CONFIG.PlayerESP.ShowTracer = Value end,
+        })
+
+        -- ═══ TAB 4: TELEMETRY & INFO ═══
+        local InfoTab = Window:CreateTab("📊 Telemetry", 4483362458)
+        InfoTab:CreateSection("Real-Time Ballistics Telemetry")
+
+        telemetryParagraph = InfoTab:CreateParagraph({
+            Title = "Active Weapon Stats",
+            Content = "Initializing TRV telemetry...",
+        })
+
+        InfoTab:CreateButton({
+            Name = "Unload / Clean Script",
+            Callback = function()
+                if _G.SKYFIRE_ENHANCED_CLEANUP then
+                    _G.SKYFIRE_ENHANCED_CLEANUP()
+                end
+            end,
+        })
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- MASTER RENDER STEP
+-- ═══════════════════════════════════════════════════════════════════════
+local lastTelemUpdate = 0
+
 local function onRenderStep(dt)
     Camera = workspace.CurrentCamera
     if not Camera then return end
-    
-    updateDroneESP(dt)
-    updatePlayerESP()
+
+    local camPos = Camera.CFrame.Position
+
+    -- Fast cached weapon check
+    updateActiveWeaponBallistics()
+
+    -- Throttle Rayfield paragraph updates to 2Hz to completely eliminate UI lag
+    local now = tick()
+    if telemetryParagraph and (now - lastTelemUpdate > 0.5) then
+        lastTelemUpdate = now
+        pcall(function()
+            telemetryParagraph:Set({
+                Title = "Active Weapon: " .. currentWeaponName,
+                Content = string.format("Muzzle Velocity: %.0f studs/s\nGravity Drop: %.2f studs/s²\nAir Drag: %.5f\nAim Target: %s",
+                    currentBulletSpeed,
+                    currentBulletDrop,
+                    currentBulletDrag,
+                    aimTarget and aimTarget.Name or "None"
+                )
+            })
+        end)
+    end
+
+    -- Fast spatial passes
+    updateDroneESP(dt, camPos)
+    updatePlayerESP(camPos)
     updateAimAssist()
 end
 
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
 -- CLEANUP
--- ═══════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════
 local function cleanup()
     for _, conn in ipairs(connections) do
         pcall(function() conn:Disconnect() end)
     end
     connections = {}
-    
+
     for _, drawings in pairs(droneDrawings) do
         destroyDrawings(drawings)
     end
     droneDrawings = {}
-    droneVelocities = {}
-    
+    droneTrackers = {}
+
     for _, drawings in pairs(playerDrawings) do
         destroyDrawings(drawings)
     end
     playerDrawings = {}
-    
+
     for _, hl in pairs(playerHighlights) do
         pcall(function() hl:Destroy() end)
     end
     playerHighlights = {}
-    
-    if gui then
-        pcall(function() gui:Destroy() end)
-        gui = nil
+
+    pcall(function() fovCircle:Remove() end)
+    pcall(function() fovCircle:Destroy() end)
+
+    if RayfieldInstance and RayfieldInstance.Destroy then
+        pcall(function() RayfieldInstance:Destroy() end)
+        RayfieldInstance = nil
     end
 end
 
--- ═══════════════════════════════════════════════════════════
--- INIT
--- ═══════════════════════════════════════════════════════════
-
--- Cleanup any previous instance
+-- ═══════════════════════════════════════════════════════════════════════
+-- BOOTSTRAPPER
+-- ═══════════════════════════════════════════════════════════════════════
 if _G.SKYFIRE_ENHANCED_CLEANUP then
     pcall(_G.SKYFIRE_ENHANCED_CLEANUP)
 end
 _G.SKYFIRE_ENHANCED_CLEANUP = cleanup
 
--- Get gravity from workspace
-CONFIG.AimPrediction.Gravity = workspace.Gravity or 196.2
-
--- Create GUI
-createGUI()
-
--- Setup input
 setupInput()
+initRayfieldUIAsync()
 
--- Main render connection
-local renderConn = RunService.RenderStepped:Connect(onRenderStep)
-table.insert(connections, renderConn)
+table.insert(connections, RunService.RenderStepped:Connect(onRenderStep))
 
--- Player remove cleanup
 table.insert(connections, Players.PlayerRemoving:Connect(function(player)
     if playerDrawings[player] then
         destroyDrawings(playerDrawings[player])
@@ -1383,8 +1572,7 @@ table.insert(connections, Players.PlayerRemoving:Connect(function(player)
     end
 end))
 
-print("═══════════════════════════════════════")
-print("  ⚡ SKYFIRE ENHANCED v2.0 Loaded!")
-print("  [RShift] Toggle GUI")
-print("  [E]      Lock Aim (when Aim Assist ON)")
-print("═══════════════════════════════════════")
+print("═══════════════════════════════════════════════════════════════════")
+print("  ⚡ SKYFIRE ENHANCED v3.6 (Turret Scope Fix & Async Boot) Ready!")
+print("  [E] Hold Aim Lock  |  Rayfield Interface Loaded")
+print("═══════════════════════════════════════════════════════════════════")
